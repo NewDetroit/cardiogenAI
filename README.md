@@ -12,16 +12,17 @@ SMILES strings
 [1] ChemBERTa Semantic Extraction ── DeepChem/ChemBERTa-77M-MTR
    │                                  → dense (N, 384) chemical embeddings
    ▼
-[2] Topological Compression ──────── UMAP(n_neighbors=15, min_dist=0.1,
-   │                                       n_components=n_qubits)
+[2] Topological Compression ──────── supervised UMAP → n_qubits dims
+   │                                  (fit on train labels; test mapped label-free)
    ▼
-[3] Quantum Kernel ───────────────── ZZFeatureMap(reps=2, entanglement='linear')
-   │                                  fidelity kernel |⟨φ(x)|φ(y)⟩|²
+[3] Quantum Kernel ───────────────── bandwidth map: H, RZ(2c·z), RZZ(2c²·zₘzₙ)
+   │                                  fidelity |⟨φ(x)|φ(y)⟩|²  OR projected kernel
    ▼
 [4] Stage 1 — Supervised Triage ──── SVC(kernel='precomputed')  ⇒  QSVC
    │                                  0 = Safe (non-blocker), 1 = Toxic (blocker)
-   │                                  class-balanced · CV-tuned C · threshold-calibrated
-   │                                  · benchmarked vs. a classical RBF-SVC baseline
+   │                                  class-balanced · bandwidth c + C + threshold
+   │                                  chosen on a leakage-free validation holdout
+   │                                  · benchmarked vs. classical kernels
    ▼
 [5] Stage 2 — Sub-group Discovery ── SpectralClustering(affinity='precomputed')
                                       over the quantum-kernel sub-matrix of the
@@ -52,18 +53,54 @@ SMILES strings
 
 ## What's in Stage 1 (beyond a plain SVC)
 
-The QSVC triage is hardened so it does not collapse into a trivial
-"predict-everything-toxic" classifier:
+The QSVC triage is hardened so it neither collapses to a trivial one-class
+predictor nor reports leaked numbers:
 
-- `class_weight='balanced'` and a **cross-validated `C`** (grid in
-  `PipelineConfig.tune_C`);
-- **decision-threshold calibration** via Youden's J on out-of-fold training
-  scores (proper precomputed-kernel CV that slices the train columns, not just
-  the rows);
-- **cross-validated ROC-AUC** reporting (mean ± std), not a single split;
-- a **classical baseline** (RBF-SVC + logistic regression on the raw 384-d
-  ChemBERTa embeddings) so you can see the quantum path's performance *relative
-  to a strong classical model* and quantify the cost of UMAP compression.
+- `class_weight='balanced'`, with the **encoding bandwidth `c` and `C`** grid-searched
+  and the **decision threshold** (Youden's J) all chosen on a **validation holdout**
+  embedded without labels — leakage-free;
+- honest **validation AUC** and **test AUC** (a k-fold CV *inside* a supervised
+  embedding would leak and read ≈ 1.0);
+- **layered classical baselines**: RBF/linear SVC on the *same* UMAP features
+  (`*_umap`, the apples-to-apples control) and on the raw 384-d ChemBERTa
+  embeddings (`*_384`, the ceiling you forgo by compressing) — all trained on *fit*,
+  reported on *test*, so the comparison is fair.
+
+## Beating kernel concentration (the hard part)
+
+Fidelity quantum kernels **concentrate exponentially**: as the effective Hilbert
+space grows, every off-diagonal `|⟨φ(x)|φ(y)⟩|²` shrinks toward 0 and the kernel
+degenerates to the identity — the QSVC then predicts a single class regardless of
+data quality. This pipeline fixes it on two fronts:
+
+**1. Constrain the circuit.**
+- **Bandwidth `c`** — the feature map encodes `RZ(2c·z_k)` and `RZZ(2c²·z_m·z_n)`,
+  and `c` is grid-searched (`tune_bandwidth`). Small `c` keeps phases from wandering
+  across `[0,2π)`, which is what causes the destructive interference. Measured mean
+  off-diagonal fidelity on 8 qubits: `c=0.05 → 0.997`, `c=0.7 → 0.43`, `c=2.0 → 0.005`
+  — so `c` tunes the kernel from all-ones to identity, and selection lands in the
+  usable middle.
+- **No `(π−z)` offsets** — the Qiskit `ZZFeatureMap` default inflates phase variance;
+  we use plain `z_m·z_n`.
+- **`reps=1`, linear/circular entanglement, few qubits (6–10)** — each repetition and
+  every extra qubit compounds the spread.
+
+**2. Give the embedding labels + measure health.**
+- **Supervised UMAP** (`umap_supervised`, `umap_target_weight`) shapes the compression
+  with class structure (fit on train, test mapped label-free).
+- Every run **logs the off-diagonal distribution and kernel-target alignment (KTA)** and
+  warns on a near-identity (concentrated) or near-ones (too-weak) kernel.
+
+**3. Projected quantum kernel** (`kernel_type="projected"`, Huang et al. 2021):
+instead of state overlap, build a Gaussian kernel on single-qubit **Bloch vectors**
+of `|φ(z)⟩`. This sidesteps concentration structurally (not by tuning), halves circuit
+depth (no `U†` inversion), and is far more shot/noise-tolerant — the architecture to
+prefer for real hardware.
+
+**Leakage-free selection.** Because supervised UMAP uses labels, model selection runs on
+a **fit/val/test** split: UMAP fits on *fit*, and bandwidth/`C`/threshold are chosen on a
+*val* set embedded without labels. The reported **validation AUC** and **test AUC** are
+honest (a k-fold CV inside a supervised embedding would leak and read ~1.0).
 
 ## Scalable quantum kernel
 
@@ -72,9 +109,8 @@ A fidelity quantum kernel is O(N²). Qiskit's `FidelityQuantumKernel` runs O(N²
 `QuantumProcessor` instead **simulates each feature-map circuit once** with the
 statevector simulator (O(N) simulations) and forms all pairwise overlaps by
 vectorised inner products — mathematically identical to a noiseless fidelity
-kernel, but a ~300×300 kernel takes ~1 s instead of minutes. Set
-`use_fidelity_primitive=True` to switch back to Qiskit's primitive (e.g. for a
-hardware-backed sampler).
+kernel, but a ~300×300 kernel takes ~1 s instead of minutes. The projected
+kernel reuses the same statevectors.
 
 ## Run in Google Colab (easiest)
 
@@ -121,7 +157,7 @@ smiles, labels, names = load_herg_dataset(
 # ...or a CSV you downloaded from any official source (columns auto-detected):
 # smiles, labels, names = load_herg_dataset(local_path="herg.csv", n_samples=408)
 
-config = PipelineConfig(n_qubits=16, n_clusters=3, n_samples=408)
+config = PipelineConfig(n_qubits=8, n_clusters=3, n_samples=408)
 result = ToxicityPipeline(config).run(smiles, labels, names)
 
 print_report(result)              # Stage 1 + baseline table + Stage 2 sub-groups
@@ -138,16 +174,21 @@ print(result.cluster_summary)     # per-sub-group physicochemical profile
 |---|---|---|
 | `model_name` | `DeepChem/ChemBERTa-77M-MTR` | HuggingFace chemical LM |
 | `pooling` | `mean` | `mean` (masked), `cls`, or `pooler` token reduction |
-| `n_qubits` | `16` | UMAP output dim = qubit count (8 or 16) |
-| `feature_map_reps` | `3` | ZZFeatureMap repetitions |
-| `n_samples` | `408` | balanced working-set size (mind memory: `2**n_qubits`/mol) |
-| `max_quantum_samples` | `1000` | hard cap on molecules in the quantum kernel |
-| `tune_C` | `(0.1, 1, 10, 100)` | CV grid for the QSVC `C` (`()` disables) |
+| `n_qubits` | `8` | UMAP output dim = qubit count (keep **6–10**) |
+| `umap_supervised` | `True` | shape the embedding with class labels (fit set only) |
+| `umap_target_weight` | `0.5` | supervised-UMAP label weight (0=unsup, 1=full) |
+| `feature_map_reps` | `1` | feature-map repetitions (each one compounds phase spread) |
+| `entanglement` | `linear` | `linear`, `circular`, or `full` |
+| `kernel_type` | `fidelity` | `fidelity` or `projected` (Bloch-vector Gaussian) |
+| `projected_gamma` | `1.0` | Gaussian width for the projected kernel |
+| `encoding_scale` | `0.4` | bandwidth `c` fallback if `tune_bandwidth` is empty |
+| `tune_bandwidth` | `(.05,.1,.2,.4,.7,1)` | bandwidth grid (searched by validation AUC) |
+| `tune_C` | `(0.1, 1, 10, 100)` | grid for the QSVC `C` |
 | `class_weight` | `balanced` | SVC class weighting |
-| `calibrate_threshold` | `True` | pick decision threshold from train CV |
-| `cv_folds` | `5` | folds for CV tuning / reporting |
-| `run_classical_baseline` | `True` | also fit RBF-SVC + logreg on raw embeddings |
-| `use_fidelity_primitive` | `False` | use Qiskit `FidelityQuantumKernel` instead of exact statevector |
+| `calibrate_threshold` | `True` | pick decision threshold on the validation holdout |
+| `val_size` | `0.2` | fraction of train held out for leakage-free selection |
+| `n_samples` | `408` | balanced working-set size |
+| `max_quantum_samples` | `1000` | hard cap on molecules in the quantum kernel |
 | `n_clusters` | `3` | Stage 2 sub-group count |
 
 ## Architecture
