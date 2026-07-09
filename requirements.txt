@@ -10,3 +10,7 @@ numpy>=1.24
 scipy>=1.10
 pandas>=2.0
 rdkit>=2023.9
+
+# Optional: official hERG dataset source (Therapeutics Data Commons).
+# Not needed if you pass your own CSV via load_herg_dataset(local_path=...).
+# PyTDC>=0.4

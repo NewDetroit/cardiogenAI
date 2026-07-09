@@ -37,14 +37,16 @@ SMILES strings
   on ~77M molecules). There is **no random-initialised fallback** — if the
   weights cannot be fetched, the pipeline raises a clear error rather than
   silently degrading.
-- **Real, large dataset.** `load_herg_dataset()` downloads the **Karim et al.
-  (2021) "CardioTox" hERG benchmark — ~12,620 molecules** with binary
-  hERG-blocker labels (6,643 blockers / 5,977 non-blockers), from the public
-  [CardioTox repository](https://github.com/Abdulk084/CardioTox). Invalid SMILES
-  are dropped with RDKit and a **class-balanced** working subsample is drawn for
-  the (O(N²)) quantum kernel. A quick fingerprint baseline puts the data's
-  learnable signal at **CV ROC-AUC ≈ 0.76**, so it is a genuine benchmark, not a
-  toy.
+- **Real, large, official dataset.** `load_herg_dataset()` loads an official
+  hERG blockers benchmark from **[Therapeutics Data Commons
+  (TDC)](https://tdcommons.ai/single_pred_tasks/tox/)** — by default
+  `hERG_Karim` (Karim et al. 2021, **~13,445 molecules**); `hERG` (Wang et al.
+  2016, ~655 molecules) is also available. Invalid SMILES are dropped with RDKit
+  and a **class-balanced** working subsample is drawn for the (O(N²)) quantum
+  kernel. A quick fingerprint baseline puts the data's learnable signal at **CV
+  ROC-AUC ≈ 0.76**, so it is a genuine benchmark, not a toy. You can also point
+  the loader at **any hERG CSV you download** (`local_path=...`); the SMILES and
+  label columns are auto-detected.
 - **Named-drug sanity panel.** `load_known_drug_panel()` provides 30 curated
   marketed drugs (Terfenadine, Dofetilide, … vs. Aspirin, Metformin, …) with
   RDKit-canonical SMILES for interpretable spot checks.
@@ -83,11 +85,11 @@ Open **`cardiotoxicity_pipeline_colab.ipynb`** in Colab and choose
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/NewDetroit/cardiogenAI/blob/claude/hybrid-qml-classification-pipeline-ulmbrp/cardiotoxicity_pipeline_colab.ipynb)
 
 Self-contained (writes the module to disk — no clone needed): installs
-dependencies, downloads real ChemBERTa + the real hERG dataset, runs all five
-stages, and plots the quantum-vs-classical AUC comparison, the kernel heatmap,
-and a 2-D molecule map. Colab reaches `huggingface.co` and
-`raw.githubusercontent.com` by default; a **GPU runtime** is recommended for
-embedding 800+ molecules.
+dependencies, downloads real ChemBERTa + the official TDC hERG dataset, runs all
+five stages, and plots the quantum-vs-classical AUC comparison, the kernel
+heatmap, and a 2-D molecule map. Colab reaches `huggingface.co` and the TDC
+dataset servers by default; a **GPU runtime** is recommended for embedding 800+
+molecules.
 
 ## Installation (local)
 
@@ -97,8 +99,9 @@ Python 3.10+ required.
 pip install -r requirements.txt
 ```
 
-Local runs need network access to `huggingface.co` (ChemBERTa) and
-`raw.githubusercontent.com` (hERG CSV); both are cached after first use.
+Local runs need network access to `huggingface.co` (ChemBERTa) and, for the
+default TDC data source, `pip install PyTDC`. Alternatively pass your own hERG
+CSV via `load_herg_dataset(local_path=...)` — no network needed for the data.
 
 ## Usage
 
@@ -113,8 +116,10 @@ from cardiotoxicity_pipeline import (
     ToxicityPipeline, PipelineConfig, load_herg_dataset, print_report,
 )
 
-# real hERG benchmark, class-balanced 800-molecule working set
-smiles, labels, names = load_herg_dataset(n_samples=800)
+# Official hERG benchmark via TDC (pip install PyTDC), class-balanced 800-mol set
+smiles, labels, names = load_herg_dataset(source="tdc", tdc_name="hERG_Karim", n_samples=800)
+# ...or a CSV you downloaded from any official source (columns auto-detected):
+# smiles, labels, names = load_herg_dataset(local_path="herg.csv", n_samples=800)
 
 config = PipelineConfig(n_qubits=8, n_clusters=3, n_samples=800)
 result = ToxicityPipeline(config).run(smiles, labels, names)
@@ -148,7 +153,7 @@ print(result.cluster_summary)     # per-sub-group physicochemical profile
 
 | Class / function | Responsibility |
 |---|---|
-| `load_herg_dataset` | Download + cache the real hERG benchmark; balanced subsample |
+| `load_herg_dataset` | Load an official hERG benchmark (TDC) or your CSV; balanced subsample |
 | `load_known_drug_panel` | 30 curated named drugs for interpretable checks |
 | `MoleculeEmbedder` | SMILES → ChemBERTa embeddings (masked-mean pooling) |
 | `TopologicalCompressor` | UMAP fit/transform + scaling to `[0, π]` angles |
@@ -172,3 +177,15 @@ Increase `n_samples` and `n_qubits` (with a GPU) to push performance. Stage 2's
 sub-groups are reported with a physicochemical profile (MW, LogP, TPSA,
 aromatic rings, H-bond donors/acceptors) so each cluster is chemically
 interpretable.
+
+## Official dataset links
+
+| Dataset | Source | Load |
+|---|---|---|
+| **hERG blockers (Karim et al. 2021, ~13,445)** | [TDC](https://tdcommons.ai/single_pred_tasks/tox/) | `load_herg_dataset(source="tdc", tdc_name="hERG_Karim")` |
+| **hERG blockers (Wang et al. 2016, ~655)** | [TDC](https://tdcommons.ai/single_pred_tasks/tox/) | `load_herg_dataset(source="tdc", tdc_name="hERG")` |
+| Underlying bioactivity source | [ChEMBL target CHEMBL240](https://www.ebi.ac.uk/chembl/target_report_card/CHEMBL240/) | — |
+| Your own CSV (SMILES + label) | any | `load_herg_dataset(local_path="herg.csv")` |
+
+TDC access needs `pip install PyTDC`. The TDC label convention is `1` = hERG
+blocker (cardiotoxic), `0` = non-blocker.

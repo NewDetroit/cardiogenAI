@@ -32,11 +32,12 @@ Real data, real model
 ----------------------
 * **Model:** the pretrained ChemBERTa chemical language model is loaded from the
   Hugging Face Hub (no random-initialised stand-in).
-* **Data:** a real, large hERG cardiotoxicity benchmark -- the Karim et al.
-  (2021) "CardioTox" training/validation set of ~12,620 molecules with binary
-  hERG-blocker labels -- is downloaded and (optionally) subsampled to a
-  balanced working set. A curated panel of 30 named marketed drugs is also
-  provided for interpretable sanity checks.
+* **Data:** an official, large hERG cardiotoxicity benchmark from Therapeutics
+  Data Commons -- ``hERG_Karim`` (Karim et al. 2021, ~13,445 molecules) or
+  ``hERG`` (Wang et al. 2016, ~655) -- with binary hERG-blocker labels, or any
+  CSV you download (``local_path``). It is (optionally) subsampled to a balanced
+  working set. A curated panel of 30 named marketed drugs is also provided for
+  interpretable sanity checks.
 
 Because a fidelity quantum kernel is O(N^2), the quantum stages run on a
 balanced subsample (configurable). The classical baseline and cross-validation
@@ -48,9 +49,10 @@ Requirements
     pip install qiskit qiskit-machine-learning qiskit-aer scikit-learn \
                 umap-learn transformers torch pandas rdkit
 
-Network: Step 1 downloads ChemBERTa from ``huggingface.co``; the data loader
-downloads the hERG CSV from ``raw.githubusercontent.com``. Both are cached
-locally after the first run.
+Network: Step 1 downloads ChemBERTa from ``huggingface.co`` (cached after first
+run). The hERG data comes from an official source of your choice -- Therapeutics
+Data Commons (``pip install PyTDC``) by default, or any CSV you download and
+pass via ``local_path`` (see ``load_herg_dataset``).
 
 Author: CardiogenAI
 """
@@ -58,10 +60,8 @@ Author: CardiogenAI
 from __future__ import annotations
 
 import logging
-import lzma
 import os
 import tarfile
-import urllib.request
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -640,12 +640,25 @@ def _characterise_clusters(smiles, labels, n_clusters) -> dict:
 
 
 # --------------------------------------------------------------------------- #
-# Data loading
+# Data loading -- official hERG cardiotoxicity datasets
 # --------------------------------------------------------------------------- #
-_HERG_URL = (
-    "https://raw.githubusercontent.com/Abdulk084/CardioTox/master/"
-    "data/train_validation_cardio_tox_data.tar.xz"
-)
+# Recommended official source: Therapeutics Data Commons (TDC).
+#     https://tdcommons.ai/single_pred_tasks/tox/#herg-blockers-karim-et-al
+#     pip install PyTDC
+#     from tdc.single_pred import Tox
+#     Tox(name="hERG")        -> Wang et al. 2016   (~655 drugs)
+#     Tox(name="hERG_Karim")  -> Karim et al. 2021  (~13,445 drugs)
+# get_data() returns a DataFrame with columns: Drug_ID, Drug (SMILES), Y (label;
+# 1 = hERG blocker / cardiotoxic, 0 = non-blocker).
+#
+# Alternatively, pass ``local_path`` pointing at any CSV you downloaded (from
+# TDC, ChEMBL target CHEMBL240, a Kaggle mirror, etc.). The SMILES and label
+# columns are auto-detected (or name them with ``smiles_col`` / ``label_col``).
+
+# Common column-name aliases used for auto-detection in a user-supplied CSV.
+_SMILES_ALIASES = ("smiles", "drug", "canonical_smiles", "smi", "mol", "structure")
+_LABEL_ALIASES = ("y", "activity", "label", "class", "target", "toxic",
+                   "blocker", "herg", "active", "outcome")
 
 
 def _default_cache_dir() -> str:
@@ -668,19 +681,102 @@ def _balanced_subsample(labels: np.ndarray, n: int, seed: int) -> np.ndarray:
     return idx
 
 
+def _pick_column(columns, given, aliases, kind):
+    """Resolve a column name from an explicit choice or alias list."""
+    lower = {c.lower(): c for c in columns}
+    if given is not None:
+        if given in columns:
+            return given
+        if given.lower() in lower:
+            return lower[given.lower()]
+        raise ValueError(f"{kind} column '{given}' not found in {list(columns)}")
+    for alias in aliases:
+        if alias in lower:
+            return lower[alias]
+    # last resort: substring match
+    for c in columns:
+        if any(a in c.lower() for a in aliases):
+            return c
+    return None
+
+
+def _read_dataframe(path: str):
+    """Read a CSV / CSV.gz / .tar.xz(csv inside) into a DataFrame."""
+    import pandas as pd
+
+    if path.endswith((".tar.xz", ".tar.gz", ".tgz")):
+        mode = "r:xz" if path.endswith(".tar.xz") else "r:gz"
+        with tarfile.open(path, mode) as tar:
+            member = next(m for m in tar.getmembers() if m.name.endswith(".csv"))
+            with tar.extractfile(member) as fh:
+                return pd.read_csv(fh)
+    return pd.read_csv(path)  # pandas transparently handles .gz/.zip
+
+
+def _from_local(path, smiles_col, label_col):
+    """Load SMILES + binary labels from a user-supplied CSV file."""
+    logger.info("Loading hERG data from local file: %s", path)
+    df = _read_dataframe(path)
+    s_col = _pick_column(df.columns, smiles_col, _SMILES_ALIASES, "SMILES")
+    l_col = _pick_column(df.columns, label_col, _LABEL_ALIASES, "label")
+    if s_col is None:
+        raise ValueError(f"Could not find a SMILES column in {list(df.columns)}; "
+                         "pass smiles_col=...")
+    if l_col is None:
+        if len(df.columns) == 2:  # 2-column file: the non-SMILES column is the label
+            l_col = [c for c in df.columns if c != s_col][0]
+        else:
+            raise ValueError(f"Could not find a label column in {list(df.columns)}; "
+                             "pass label_col=...")
+    df = df[[s_col, l_col]].dropna()
+    return df[s_col].astype(str).tolist(), df[l_col].astype(int).to_numpy()
+
+
+def _from_tdc(tdc_name, cache_dir):
+    """Load an official hERG dataset via Therapeutics Data Commons (PyTDC)."""
+    try:
+        from tdc.single_pred import Tox
+    except ImportError as err:
+        raise RuntimeError(
+            "The default hERG source needs Therapeutics Data Commons. Either\n"
+            "  pip install PyTDC\n"
+            "or download an official hERG CSV and pass it via "
+            "load_herg_dataset(local_path='herg.csv'). "
+            "Official dataset: https://tdcommons.ai/single_pred_tasks/tox/"
+        ) from err
+    logger.info("Loading official TDC dataset '%s' ...", tdc_name)
+    data = Tox(name=tdc_name, path=cache_dir or _default_cache_dir())
+    df = data.get_data()  # columns: Drug_ID, Drug (SMILES), Y (0/1)
+    return df["Drug"].astype(str).tolist(), df["Y"].astype(int).to_numpy()
+
+
 def load_herg_dataset(
     n_samples: int | None = 800,
     balanced: bool = True,
+    *,
+    source: str = "tdc",
+    tdc_name: str = "hERG_Karim",
+    local_path: str | None = None,
+    smiles_col: str | None = None,
+    label_col: str | None = None,
     cache_dir: str | None = None,
-    url: str = _HERG_URL,
     random_state: int = 42,
     validate: bool = True,
 ) -> tuple[list[str], np.ndarray, list[str]]:
-    """Load the real Karim et al. (2021) hERG cardiotoxicity benchmark.
+    """Load an official hERG cardiotoxicity dataset.
 
-    ~12,620 marketed/experimental molecules with binary hERG-blocker labels
-    (1 = blocker / cardiotoxic, 0 = non-blocker). Downloaded once from the
-    public CardioTox repository and cached locally.
+    Label convention: 1 = hERG blocker (cardiotoxic), 0 = non-blocker.
+
+    Sources
+    -------
+    local_path : str
+        Path to a CSV / CSV.gz you downloaded from any official source. The
+        SMILES and binary-label columns are auto-detected (aliases include
+        'smiles'/'drug' and 'y'/'activity'/'label'); override with
+        ``smiles_col`` / ``label_col``. Takes precedence over ``source``.
+    source="tdc" (default) : Therapeutics Data Commons (needs ``pip install PyTDC``).
+        ``tdc_name="hERG_Karim"`` -> Karim et al. 2021 (~13,445 molecules);
+        ``tdc_name="hERG"``       -> Wang et al. 2016 (~655 molecules).
 
     Parameters
     ----------
@@ -691,28 +787,12 @@ def load_herg_dataset(
 
     Returns (smiles, labels, names).
     """
-    import pandas as pd
-
-    cache_dir = cache_dir or _default_cache_dir()
-    csv_path = os.path.join(cache_dir, "herg_cardiotox.csv")
-    if not os.path.exists(csv_path):
-        archive = os.path.join(cache_dir, "herg_cardiotox.tar.xz")
-        if not os.path.exists(archive):
-            logger.info("Downloading real hERG dataset from %s ...", url)
-            urllib.request.urlretrieve(url, archive)
-        logger.info("Extracting hERG dataset ...")
-        with tarfile.open(archive, "r:xz") as tar:
-            member = next(m for m in tar.getmembers() if m.name.endswith(".csv"))
-            with tar.extractfile(member) as fh:
-                # Read only the two columns we need from the wide descriptor CSV.
-                df = pd.read_csv(fh, usecols=["ACTIVITY", "smiles"])
-        df.to_csv(csv_path, index=False)
+    if local_path is not None:
+        smiles, labels = _from_local(local_path, smiles_col, label_col)
+    elif source == "tdc":
+        smiles, labels = _from_tdc(tdc_name, cache_dir)
     else:
-        df = pd.read_csv(csv_path)
-
-    df = df.dropna(subset=["smiles", "ACTIVITY"]).reset_index(drop=True)
-    smiles = df["smiles"].astype(str).tolist()
-    labels = df["ACTIVITY"].astype(int).to_numpy()
+        raise ValueError(f"Unknown source '{source}'. Use source='tdc' or pass local_path=...")
 
     if validate:
         smiles, labels = _filter_valid_smiles(smiles, labels)
