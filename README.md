@@ -15,14 +15,14 @@ SMILES strings
 [2] Topological Compression ──────── supervised UMAP → n_qubits dims
    │                                  (fit on train labels; test mapped label-free)
    ▼
-[3] Quantum Kernel ───────────────── bandwidth map: H, RZ(2c·z), RZZ(2c²·zₘzₙ)
-   │                                  fidelity |⟨φ(x)|φ(y)⟩|²  OR projected kernel
+[3] Quantum Kernel ───────────────── feature map: H, RZ(2α·z), RZZ(2β·zₘzₙ), reps≥2
+   │                                  projected (2-RDM Gaussian) kernel, or fidelity
    ▼
 [4] Stage 1 — Supervised Triage ──── SVC(kernel='precomputed')  ⇒  QSVC
    │                                  0 = Safe (non-blocker), 1 = Toxic (blocker)
-   │                                  class-balanced · bandwidth c + C + threshold
+   │                                  class-balanced · (α, β, γ, C) + threshold
    │                                  chosen on a leakage-free validation holdout
-   │                                  · benchmarked vs. classical kernels
+   │                                  · geometric-difference screen · repeated-split CI
    ▼
 [5] Stage 2 — Sub-group Discovery ── SpectralClustering(affinity='precomputed')
                                       over the quantum-kernel sub-matrix of the
@@ -56,9 +56,9 @@ SMILES strings
 The QSVC triage is hardened so it neither collapses to a trivial one-class
 predictor nor reports leaked numbers:
 
-- `class_weight='balanced'`, with the **encoding bandwidth `c` and `C`** grid-searched
-  and the **decision threshold** (Youden's J) all chosen on a **validation holdout**
-  embedded without labels — leakage-free;
+- `class_weight='balanced'`, with the phase scales **(α, β)**, the projected-kernel width
+  **γ**, and **`C`** grid-searched and the **decision threshold** (Youden's J) all chosen on
+  a **validation holdout** embedded without labels — leakage-free;
 - honest **validation AUC** and **test AUC** (a k-fold CV *inside* a supervised
   embedding would leak and read ≈ 1.0);
 - **layered classical baselines**: RBF/linear SVC on the *same* UMAP features
@@ -66,41 +66,48 @@ predictor nor reports leaked numbers:
   embeddings (`*_384`, the ceiling you forgo by compressing) — all trained on *fit*,
   reported on *test*, so the comparison is fair.
 
-## Beating kernel concentration (the hard part)
+## Designing a quantum kernel that isn't secretly classical
 
-Fidelity quantum kernels **concentrate exponentially**: as the effective Hilbert
-space grows, every off-diagonal `|⟨φ(x)|φ(y)⟩|²` shrinks toward 0 and the kernel
-degenerates to the identity — the QSVC then predicts a single class regardless of
-data quality. This pipeline fixes it on two fronts:
+A naive fidelity kernel on this problem is boxed in three ways, and the fix is a
+**design** change, not tuning:
 
-**1. Constrain the circuit.**
-- **Bandwidth `c`** — the feature map encodes `RZ(2c·z_k)` and `RZZ(2c²·z_m·z_n)`,
-  and `c` is grid-searched (`tune_bandwidth`). Small `c` keeps phases from wandering
-  across `[0,2π)`, which is what causes the destructive interference. Measured mean
-  off-diagonal fidelity on 8 qubits: `c=0.05 → 0.997`, `c=0.7 → 0.43`, `c=2.0 → 0.005`
-  — so `c` tunes the kernel from all-ones to identity, and selection lands in the
-  usable middle.
-- **No `(π−z)` offsets** — the Qiskit `ZZFeatureMap` default inflates phase variance;
-  we use plain `z_m·z_n`.
-- **`reps=1`, linear/circular entanglement, few qubits (6–10)** — each repetition and
-  every extra qubit compounds the spread.
+1. **The r=1 degeneracy.** At one repetition with small phases, `K_F ≈ 1 − c²‖x−y‖²`
+   — the "quantum" SVM is literally a classical squared-distance machine (and the
+   projected kernel reduces to an RBF on angles). So the default uses **`reps=2`**: a
+   second Hadamard+phase block breaks the closed form and produces non-trivial
+   amplitudes and nonzero `Z` marginals — where expressivity actually starts.
+2. **The bandwidth trap.** For an `r=1` fidelity kernel, larger phases → concentration
+   (`K→I`), smaller → collapse to all-ones; there is no good middle. So the map uses
+   **decoupled phase scales** `2α·z_k` (single-qubit) and `2β·z_m·z_n` (coupling),
+   tuned **independently** (not `β=α²`, which welds the coupling to a tiny number),
+   with **no `(π−z)` offsets**.
+3. **A front-end that favors the competition.** Supervised UMAP pulls same-label points
+   together in *Euclidean* distance — exactly what the classical RBF/linear controls
+   consume. Set `compressor="pca"` or `umap_supervised=False` for a front-end that
+   doesn't pre-optimize the space for distance kernels.
 
-**2. Give the embedding labels + measure health.**
-- **Supervised UMAP** (`umap_supervised`, `umap_target_weight`) shapes the compression
-  with class structure (fit on train, test mapped label-free).
-- Every run **logs the off-diagonal distribution and kernel-target alignment (KTA)** and
-  warns on a near-identity (concentrated) or near-ones (too-weak) kernel.
+**Projected kernel with 2-RDMs (default).** `kernel_type="projected"` builds a Gaussian
+kernel on **reduced-density-matrix descriptors** of `|φ(z)⟩` — single-qubit Bloch vectors
+and (`projected_order=2`) the **two-qubit RDMs on the entangling pairs** (Huang et al.
+2021). It's structurally immune to global concentration (so it runs at O(1) phases),
+halves depth (no `U†`), and is hardware-friendlier. The RDM features are exact
+(verified against Qiskit `partial_trace`).
 
-**3. Projected quantum kernel** (`kernel_type="projected"`, Huang et al. 2021):
-instead of state overlap, build a Gaussian kernel on single-qubit **Bloch vectors**
-of `|φ(z)⟩`. This sidesteps concentration structurally (not by tuning), halves circuit
-depth (no `U†` inversion), and is far more shot/noise-tolerant — the architecture to
-prefer for real hardware.
+**Wiring.** `entanglement="full"` (all pairs, trivial in simulation) or `"mutual_info"`
+(edges between the most correlated compressed coordinates) instead of an arbitrary linear
+chain.
 
-**Leakage-free selection.** Because supervised UMAP uses labels, model selection runs on
-a **fit/val/test** split: UMAP fits on *fit*, and bandwidth/`C`/threshold are chosen on a
-*val* set embedded without labels. The reported **validation AUC** and **test AUC** are
-honest (a k-fold CV inside a supervised embedding would leak and read ~1.0).
+**Honest evaluation, built in.**
+- **Leakage-free selection:** a **fit/val/test** split — supervised compression fits on
+  *fit*; `(α, β, γ, C)` and the threshold are chosen on a *val* set embedded without
+  labels; *test* is reported once. (A k-fold CV *inside* a supervised embedding leaks and
+  reads ≈ 1.0.)
+- **Geometric difference `g(K_C‖K_Q)`** (Huang et al.) screens whether *any* labeling of
+  this data could favor the quantum kernel over a classical RBF — logged every run.
+- **`repeated_evaluation(...)`** reports test AUC as **mean ± 95% CI** across seeds
+  (a single ~200-point split has SE ≈ 0.03, so one number proves nothing).
+- **Same-feature classical controls** (`rbf_umap`, `linsvc_umap`) so any quantum result
+  is measured against a classical kernel on identical inputs.
 
 ## Scalable quantum kernel
 
@@ -174,17 +181,18 @@ print(result.cluster_summary)     # per-sub-group physicochemical profile
 |---|---|---|
 | `model_name` | `DeepChem/ChemBERTa-77M-MTR` | HuggingFace chemical LM |
 | `pooling` | `mean` | `mean` (masked), `cls`, or `pooler` token reduction |
-| `n_qubits` | `8` | UMAP output dim = qubit count (keep **6–10**) |
-| `umap_supervised` | `True` | shape the embedding with class labels (fit set only) |
-| `umap_target_weight` | `0.5` | supervised-UMAP label weight (0=unsup, 1=full) |
-| `feature_map_reps` | `1` | feature-map repetitions (each one compounds phase spread) |
-| `entanglement` | `linear` | `linear`, `circular`, or `full` |
-| `kernel_type` | `fidelity` | `fidelity` or `projected` (Bloch-vector Gaussian) |
-| `projected_gamma` | `1.0` | Gaussian width for the projected kernel |
-| `encoding_scale` | `0.4` | bandwidth `c` fallback if `tune_bandwidth` is empty |
-| `tune_bandwidth` | `(.05,.1,.2,.4,.7,1)` | bandwidth grid (searched by validation AUC) |
+| `n_qubits` | `8` | compressed dim = qubit count (keep **6–10**) |
+| `compressor` | `umap` | `umap` or `pca` (PCA = label-agnostic front-end) |
+| `umap_supervised` | `True` | shape UMAP with labels (helps distance-kernel controls) |
+| `feature_map_reps` | `2` | repetitions (≥2 needed to break the r=1 degeneracy) |
+| `entanglement` | `full` | `full`, `linear`, `circular`, or `mutual_info` |
+| `kernel_type` | `projected` | `projected` (RDM Gaussian) or `fidelity` |
+| `projected_order` | `2` | `1` = single-qubit RDMs; `2` = + two-qubit RDMs |
+| `tune_alpha` | `(0.5, 1, 2)` | single-qubit phase-scale grid |
+| `tune_beta` | `(0, .5, 1, 2)` | coupling phase-scale grid (`0` = no entanglement) |
+| `tune_gamma` | `(0.5, 1, 2)` | projected-kernel width (× median heuristic) |
 | `tune_C` | `(0.1, 1, 10, 100)` | grid for the QSVC `C` |
-| `class_weight` | `balanced` | SVC class weighting |
+| `geometric_difference` | `True` | log `g(K_C‖K_Q)` each run |
 | `calibrate_threshold` | `True` | pick decision threshold on the validation holdout |
 | `val_size` | `0.2` | fraction of train held out for leakage-free selection |
 | `n_samples` | `408` | balanced working-set size |

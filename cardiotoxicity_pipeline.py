@@ -136,39 +136,45 @@ class PipelineConfig:
     embedding_batch_size: int = 32
     pooling: str = "mean"  # "mean" (masked mean), "cls", or "pooler"
 
-    # --- Step 2: UMAP compression ---
-    # n_qubits controls the Hilbert-space dimension (2**n_qubits). Large values
-    # cause *kernel concentration*: fidelities -> 0 for all x != y and the kernel
-    # degenerates to the identity matrix. Keep n_qubits small (6-10).
-    n_qubits: int = 8               # UMAP output dim == number of qubits
+    # --- Step 2: dimensionality compression ---
+    n_qubits: int = 8               # compressed dim == number of qubits (8/12/16)
+    compressor: str = "umap"        # "umap" or "pca"
     umap_n_neighbors: int = 15
     umap_min_dist: float = 0.1
     umap_metric: str = "cosine"
     # Supervised UMAP shapes the embedding with class labels (train only; test is
-    # mapped label-free via transform()). target_weight in [0,1]: 0 = unsupervised,
-    # 1 = fully supervised (risks train/test mismatch); 0.3-0.6 is a good range.
+    # mapped label-free via transform()). NOTE: doing so pre-optimises the space
+    # for Euclidean/distance kernels -- i.e. it helps the classical controls the
+    # quantum map competes with. Set umap_supervised=False (or compressor='pca')
+    # for a front-end that does not favour distance kernels.
     umap_supervised: bool = True
     umap_target_weight: float = 0.5
 
     # --- Step 3: Quantum feature map / kernel ---
-    feature_map_reps: int = 1       # each rep compounds phase spread -> use 1
-    entanglement: str = "linear"    # "linear", "circular", or "full"
-    kernel_type: str = "fidelity"   # "fidelity" or "projected" (Huang et al. 2021)
-    projected_gamma: float = 1.0    # Gaussian width for the projected kernel
-    # Encoding bandwidth c: phases are 2*c*z (and 2*c^2*z_m*z_n). c < 1 counters
-    # concentration (Shaydulin & Wild 2022). tune_bandwidth grid-searches it by
-    # kernel-target alignment; () disables and uses encoding_scale directly.
-    encoding_scale: float = 0.4
-    tune_bandwidth: tuple[float, ...] = (0.05, 0.1, 0.2, 0.4, 0.7, 1.0)
-    use_fidelity_primitive: bool = False  # (legacy flag; unused by the custom map)
+    # Feature map (per rep): H on all qubits; single-qubit phase 2*alpha*z_k;
+    # coupling phase 2*beta*z_m*z_n on wired pairs. alpha and beta are DECOUPLED
+    # (not beta = alpha^2), so the coupling term is not welded to a tiny number.
+    # reps>=2 breaks the r=1 closed form (uniform-amplitude phase state) where the
+    # fidelity kernel is just a squared-distance machine and the projected kernel
+    # is an RBF on angles -- expressivity starts at reps=2.
+    feature_map_reps: int = 2
+    entanglement: str = "full"      # "linear", "circular", "full", or "mutual_info"
+    kernel_type: str = "projected"  # "projected" (Huang et al. 2021) or "fidelity"
+    projected_order: int = 2        # 1 = single-qubit RDMs; 2 = + two-qubit RDMs
+    alpha_scale: float = 1.0        # single-qubit phase scale (fallback if not tuned)
+    beta_scale: float = 1.0         # coupling phase scale (fallback if not tuned)
+    tune_alpha: tuple[float, ...] = (0.5, 1.0, 2.0)
+    tune_beta: tuple[float, ...] = (0.0, 0.5, 1.0, 2.0)  # 0.0 => no coupling
+    projected_gamma: float = 1.0    # multiplies a median-heuristic RBF width
+    tune_gamma: tuple[float, ...] = (0.5, 1.0, 2.0)
 
     # --- Step 4: QSVC triage ---
     svc_C: float = 1.0
-    tune_C: tuple[float, ...] = (0.1, 1.0, 10.0, 100.0)  # CV grid; () to disable
+    tune_C: tuple[float, ...] = (0.1, 1.0, 10.0, 100.0)
     class_weight: str | None = "balanced"
-    calibrate_threshold: bool = True      # pick decision threshold from train CV
-    cv_folds: int = 5
+    calibrate_threshold: bool = True
     run_classical_baseline: bool = True
+    geometric_difference: bool = True     # screen g(K_classical || K_quantum)
 
     # --- Step 5: Spectral clustering ---
     n_clusters: int = 3
@@ -298,35 +304,41 @@ class MoleculeEmbedder:
 # Step 2: Topological Compression (UMAP)
 # --------------------------------------------------------------------------- #
 class TopologicalCompressor:
-    """Compresses ChemBERTa embeddings to `n_qubits` dimensions with UMAP and
-    MinMax-scales each feature to [0, 1] (the quantum feature map then applies
-    the encoding bandwidth). Optionally uses **supervised** UMAP so the embedding
-    carries class structure -- fit on train labels, transform test label-free.
+    """Compresses ChemBERTa embeddings to `n_qubits` dimensions and MinMax-scales
+    each feature to [0, 1] (the quantum feature map then applies alpha/beta).
+
+    ``config.compressor``:
+      * "umap" -- UMAP, optionally **supervised** (fit on train labels, transform
+        test label-free). Supervised UMAP shapes the space by Euclidean distance,
+        which *helps the classical distance-kernel controls* -- use "pca" or
+        umap_supervised=False for a front-end that does not pre-favour them.
+      * "pca"  -- plain PCA (unsupervised, label-agnostic front-end).
     """
 
     def __init__(self, config: PipelineConfig):
         self.config = config
-        self.reducer = umap.UMAP(
-            n_neighbors=config.umap_n_neighbors,
-            min_dist=config.umap_min_dist,
-            n_components=config.n_qubits,
-            metric=config.umap_metric,
-            target_weight=config.umap_target_weight,
-            random_state=config.random_state,
-        )
+        if config.compressor == "pca":
+            from sklearn.decomposition import PCA
+            self.reducer = PCA(n_components=config.n_qubits,
+                               random_state=config.random_state)
+        else:
+            self.reducer = umap.UMAP(
+                n_neighbors=config.umap_n_neighbors,
+                min_dist=config.umap_min_dist,
+                n_components=config.n_qubits,
+                metric=config.umap_metric,
+                target_weight=config.umap_target_weight,
+                random_state=config.random_state,
+            )
         self.scaler = MinMaxScaler(feature_range=(0.0, 1.0))
         self._fitted = False
 
     def fit_transform(self, X_train: np.ndarray, y_train=None) -> np.ndarray:
-        supervised = self.config.umap_supervised and y_train is not None
-        logger.info(
-            "Fitting %s UMAP: %s -> %d dims (n_neighbors=%d, min_dist=%.2f, "
-            "metric=%s%s)",
-            "supervised" if supervised else "unsupervised",
-            X_train.shape, self.config.n_qubits, self.config.umap_n_neighbors,
-            self.config.umap_min_dist, self.config.umap_metric,
-            f", target_weight={self.config.umap_target_weight}" if supervised else "",
-        )
+        supervised = (self.config.compressor == "umap"
+                      and self.config.umap_supervised and y_train is not None)
+        logger.info("Fitting %s %s: %s -> %d dims",
+                    "supervised" if supervised else "unsupervised",
+                    self.config.compressor.upper(), X_train.shape, self.config.n_qubits)
         reduced = (self.reducer.fit_transform(X_train, y=np.asarray(y_train))
                    if supervised else self.reducer.fit_transform(X_train))
         scaled = self.scaler.fit_transform(reduced)
@@ -344,111 +356,167 @@ class TopologicalCompressor:
 # --------------------------------------------------------------------------- #
 # Step 3: Quantum Feature Map & Kernel
 # --------------------------------------------------------------------------- #
-def _entangling_pairs(n_qubits: int, entanglement: str) -> list[tuple[int, int]]:
+def _wiring_pairs(n_qubits: int, entanglement: str,
+                  features: np.ndarray | None = None) -> list[tuple[int, int]]:
+    """Entangling edges. 'full' = all C(n,2) pairs; 'linear'/'circular' = a chain;
+    'mutual_info' = the top-n_qubits feature pairs by mutual information (so the
+    couplings connect actually-correlated coordinates, not arbitrary neighbours)."""
     if entanglement == "full":
         return [(i, j) for i in range(n_qubits) for j in range(i + 1, n_qubits)]
+    if entanglement == "mutual_info" and features is not None:
+        from sklearn.metrics import mutual_info_score
+        binned = np.stack([
+            np.digitize(features[:, j], np.histogram_bin_edges(features[:, j], bins=8))
+            for j in range(n_qubits)], axis=1)
+        scored = sorted(
+            (((i, j), mutual_info_score(binned[:, i], binned[:, j]))
+             for i in range(n_qubits) for j in range(i + 1, n_qubits)),
+            key=lambda t: -t[1])
+        return [p for p, _ in scored[:n_qubits]]
     pairs = [(i, i + 1) for i in range(n_qubits - 1)]           # linear
     if entanglement == "circular" and n_qubits > 2:
         pairs.append((n_qubits - 1, 0))
     return pairs
 
 
+def _geometric_difference(K_classical: np.ndarray, K_quantum: np.ndarray,
+                          reg: float = 1e-4) -> float:
+    """Huang et al. (2021) asymmetric geometric difference
+
+        g(K_C || K_Q) = sqrt( || sqrt(K_Q) (K_C + reg I)^-1 sqrt(K_Q) ||_inf ).
+
+    Kernels are trace-normalised first. g near 1 means the classical kernel can
+    reproduce anything the quantum kernel does on this data (no possible
+    advantage from any labeling); large g is a *necessary* (not sufficient)
+    condition for a quantum-kernel advantage."""
+    def _norm(K):
+        return K * (len(K) / np.trace(K))
+    Kc, Kq = _norm(K_classical), _norm(K_quantum)
+    w, V = np.linalg.eigh(Kq)
+    sqrt_Kq = (V * np.sqrt(np.clip(w, 0.0, None))) @ V.T
+    Kc_inv = np.linalg.inv(Kc + reg * np.eye(len(Kc)))
+    M = sqrt_Kq @ Kc_inv @ sqrt_Kq
+    return float(np.sqrt(np.linalg.norm(M, 2)))
+
+
 class QuantumProcessor:
-    """Encodes features with a **bandwidth-controlled** feature map and computes
-    a quantum kernel, addressing the exponential concentration of fidelity
-    kernels (Shaydulin & Wild 2022; Huang et al. 2021).
+    """Data-encoding feature map + quantum kernel, redesigned to escape the r=1
+    degeneracy where the "quantum" kernel is provably a classical squared-distance
+    machine (fidelity) or an RBF-on-angles (projected).
 
-    Feature map (per repetition), for bandwidth ``c`` and inputs ``z`` scaled to
-    [0, 1]:
+    Feature map (per rep), inputs ``z`` in [0, 1], **decoupled** phase scales
+    ``alpha`` (single-qubit) and ``beta`` (coupling):
 
-        H on every qubit;  P(2 c z_k) on qubit k;
-        for each entangling pair (m, n):  CX; P(2 c^2 z_m z_n); CX.
+        H on every qubit;  P(2*alpha*z_k) on qubit k;
+        for each wired pair (m, n):  CX; P(2*beta*z_m*z_n); CX.
 
-    Note there are **no** ``(pi - z_m)(pi - z_n)`` offsets (the Qiskit
-    ``ZZFeatureMap`` default, a notorious concentration amplifier). Small ``c``
-    keeps phases from wandering across [0, 2pi), preventing the destructive
-    interference that drives the kernel to the identity.
+    reps >= 2 interleaves a second Hadamard+phase block, which breaks the
+    uniform-amplitude closed form and produces non-trivial amplitudes / nonzero Z
+    marginals -- where expressivity actually begins. No (pi - z) offsets.
 
     Kernels:
-      * ``kernel_type="fidelity"`` : K = |<phi(x)|phi(y)>|^2 (exact statevector).
-      * ``kernel_type="projected"``: Gaussian kernel on single-qubit Bloch
-        vectors of |phi(.)> (projected quantum kernel, Huang et al. 2021), which
-        sidesteps concentration structurally and is far more shot/noise friendly
-        on hardware.
+      * ``fidelity``  : K = |<phi(x)|phi(y)>|^2 (exact statevector).
+      * ``projected`` : Gaussian on reduced-density-matrix (RDM) descriptors of
+        |phi(.)> -- single-qubit (Bloch) and, with ``projected_order=2``, the
+        two-qubit RDMs on the wired pairs (Huang et al. 2021). Structurally immune
+        to global concentration, so it can run at O(1) phases.
     """
 
-    def __init__(self, config: PipelineConfig, bandwidth: float | None = None):
+    def __init__(self, config: PipelineConfig, alpha: float | None = None,
+                 beta: float | None = None, pairs: list[tuple[int, int]] | None = None):
         self.config = config
         self.n_qubits = config.n_qubits
-        self.bandwidth = float(config.encoding_scale if bandwidth is None else bandwidth)
+        self.alpha = float(config.alpha_scale if alpha is None else alpha)
+        self.beta = float(config.beta_scale if beta is None else beta)
+        self.pairs = pairs if pairs is not None else _wiring_pairs(
+            self.n_qubits, config.entanglement)
         self._z = ParameterVector("z", self.n_qubits)
         self.feature_map = self._build_feature_map()
-        logger.info(
-            "Quantum kernel: bandwidth c=%.3g, qubits=%d, reps=%d, entangle='%s', "
-            "kernel='%s', depth=%d",
-            self.bandwidth, self.n_qubits, config.feature_map_reps,
-            config.entanglement, config.kernel_type, self.feature_map.depth(),
-        )
 
     def _build_feature_map(self) -> QuantumCircuit:
-        c, z = self.bandwidth, self._z
+        a, b, z = self.alpha, self.beta, self._z
         qc = QuantumCircuit(self.n_qubits)
-        pairs = _entangling_pairs(self.n_qubits, self.config.entanglement)
         for _ in range(self.config.feature_map_reps):
             for k in range(self.n_qubits):
                 qc.h(k)
-                qc.p(2.0 * c * z[k], k)
-            for (m, n) in pairs:
-                qc.cx(m, n)
-                qc.p(2.0 * c * c * z[m] * z[n], n)
-                qc.cx(m, n)
+                qc.p(2.0 * a * z[k], k)
+            if b != 0.0:
+                for (m, n) in self.pairs:
+                    qc.cx(m, n)
+                    qc.p(2.0 * b * z[m] * z[n], n)
+                    qc.cx(m, n)
         return qc
 
-    def _statevectors(self, X: np.ndarray) -> np.ndarray:
+    def states(self, X: np.ndarray) -> np.ndarray:
         """Simulate the feature map once per row; return (N, 2**n_qubits) complex."""
         dim = 2 ** self.n_qubits
-        states = np.empty((len(X), dim), dtype=np.complex128)
+        out = np.empty((len(X), dim), dtype=np.complex128)
         for i, x in enumerate(X):
             bound = self.feature_map.assign_parameters(
-                {p: float(v) for p, v in zip(self._z, x)}
-            )
-            states[i] = Statevector.from_instruction(bound).data
-        return states
+                {p: float(v) for p, v in zip(self._z, x)})
+            out[i] = Statevector.from_instruction(bound).data
+        return out
 
-    def _bloch_features(self, states: np.ndarray) -> np.ndarray:
-        """Single-qubit Bloch vectors (<X>,<Y>,<Z> per qubit) for each state,
-        the classical descriptor behind the projected quantum kernel."""
-        n, dim = len(states), states.shape[1]
-        idx = np.arange(dim)
-        feats = np.empty((n, 3 * self.n_qubits))
-        probs = np.abs(states) ** 2
+    # --- Pauli algebra on statevector batches (little-endian) --------------- #
+    @staticmethod
+    def _apply_pauli(states, k, which, idx):
+        partner = idx ^ (1 << k)
+        bit = (idx >> k) & 1
+        if which == "Z":
+            return states * (1 - 2 * bit)[None, :]
+        if which == "X":
+            return states[:, partner]
+        return (-1j * (1 - 2 * bit))[None, :] * states[:, partner]   # Y
+
+    def _expval(self, states, ops, idx):
+        t = states
+        for (k, w) in ops:
+            t = self._apply_pauli(t, k, w, idx)
+        return np.real(np.sum(np.conj(states) * t, axis=1))
+
+    def rdm_features(self, states: np.ndarray) -> np.ndarray:
+        """Feature vector F such that ||F_i - F_j||^2 = sum_S ||rho_S(i)-rho_S(j)||_F^2
+        over single-qubit subsystems S (and, if projected_order>=2, the two-qubit
+        RDMs on the wired pairs). Verified against qiskit partial_trace."""
+        idx = np.arange(states.shape[1])
+        paulis = ("X", "Y", "Z")
+        cols = []
+        # single-qubit RDMs: ||drho||_F^2 = 1/2 ||dr||^2  -> scale Bloch by 1/sqrt2
         for k in range(self.n_qubits):
-            bit = (idx >> k) & 1                      # qiskit little-endian
-            partner = idx ^ (1 << k)
-            prod = np.conj(states) * states[:, partner]
-            mask0 = bit == 0
-            feats[:, 3 * k + 0] = 2.0 * prod[:, mask0].real.sum(axis=1)   # <X>
-            feats[:, 3 * k + 1] = 2.0 * prod[:, mask0].imag.sum(axis=1)   # <Y>
-            feats[:, 3 * k + 2] = (probs * (1 - 2 * bit)).sum(axis=1)      # <Z>
-        return feats
+            for w in paulis:
+                cols.append(self._expval(states, [(k, w)], idx) / np.sqrt(2.0))
+        # two-qubit RDMs on the wired pairs: ||drho||_F^2 = 1/4 sum_{PQ!=II} dc^2
+        if self.config.projected_order >= 2:
+            for (m, n) in self.pairs:
+                for w in paulis:                      # P (x) I
+                    cols.append(self._expval(states, [(m, w)], idx) / 2.0)
+                for w in paulis:                      # I (x) Q
+                    cols.append(self._expval(states, [(n, w)], idx) / 2.0)
+                for a in paulis:                      # P (x) Q
+                    for c in paulis:
+                        cols.append(self._expval(states, [(m, a), (n, c)], idx) / 2.0)
+        return np.stack(cols, axis=1)
 
-    def kernel(self, X_a: np.ndarray, X_b: np.ndarray | None = None) -> np.ndarray:
+    @staticmethod
+    def _sqdist(A, B):
+        return np.clip((A ** 2).sum(1)[:, None] + (B ** 2).sum(1)[None, :]
+                       - 2.0 * A @ B.T, 0.0, None)
+
+    def median_width(self, F: np.ndarray) -> float:
+        """Median-heuristic RBF scale: 1 / median(pairwise sq-distance)."""
+        d = self._sqdist(F, F)
+        med = np.median(d[~np.eye(len(F), dtype=bool)])
+        return 1.0 / med if med > 0 else 1.0
+
+    def kernel(self, X_a, X_b=None, gamma=None):
         """Quantum kernel between X_a and X_b (or X_a with itself)."""
-        n_b = len(X_a) if X_b is None else len(X_b)
-        logger.info("Computing %s quantum kernel (%d x %d, c=%.3g) ...",
-                    self.config.kernel_type, len(X_a), n_b, self.bandwidth)
-        S_a = self._statevectors(X_a)
-        S_b = S_a if X_b is None else self._statevectors(X_b)
+        S_a = self.states(X_a)
+        S_b = S_a if X_b is None else self.states(X_b)
         if self.config.kernel_type == "projected":
-            B_a = self._bloch_features(S_a)
-            B_b = B_a if X_b is None else self._bloch_features(S_b)
-            # ||rho_k(i)-rho_k(j)||_F^2 = 1/2 ||bloch_i-bloch_j||^2, folded into gamma.
-            sq = (
-                (B_a ** 2).sum(1)[:, None]
-                + (B_b ** 2).sum(1)[None, :]
-                - 2.0 * B_a @ B_b.T
-            )
-            return np.exp(-self.config.projected_gamma * np.clip(sq, 0.0, None))
+            F_a = self.rdm_features(S_a)
+            F_b = F_a if X_b is None else self.rdm_features(S_b)
+            g = self.median_width(F_a) * self.config.projected_gamma if gamma is None else gamma
+            return np.exp(-g * self._sqdist(F_a, F_b))
         K = np.abs(S_a.conj() @ S_b.T) ** 2
         return np.clip(K, 0.0, 1.0)
 
@@ -483,10 +551,13 @@ class PipelineResult:
     n_train: int
     full_kernel: np.ndarray = field(repr=False, default=None)
 
-    # Quantum-kernel health
-    bandwidth: float = 0.0            # selected encoding bandwidth c
-    kta: float = 0.0                  # kernel-target alignment
-    offdiag_mean: float = 0.0         # mean off-diagonal kernel entry
+    # Quantum-kernel config + health
+    alpha: float = 0.0               # selected single-qubit phase scale
+    beta: float = 0.0                # selected coupling phase scale
+    gamma: float = 0.0               # selected projected-kernel width multiplier
+    kta: float = 0.0                 # kernel-target alignment
+    offdiag_mean: float = 0.0        # mean off-diagonal kernel entry
+    gdiff: float = 0.0               # geometric difference g(K_classical || K_quantum)
 
 
 # --------------------------------------------------------------------------- #
@@ -515,40 +586,63 @@ class ToxicityPipeline:
         den = float(np.linalg.norm(K) * np.linalg.norm(yy))
         return num / den if den > 0 else 0.0
 
-    def _select_hyperparams(self, X_fit, y_fit, X_val, y_val):
-        """Jointly grid-search encoding bandwidth c and SVC C, scoring each on the
-        **clean validation set** (embedded without labels). Leakage-free because
-        the supervised UMAP only ever saw the fit set. Returns the best config and
-        the validation decision scores of the winning (fit-trained) model."""
+    def _select_hyperparams(self, X_fit, y_fit, X_val, y_val, pairs):
+        """Grid-search the DECOUPLED phase scales (alpha, beta), the projected
+        kernel width (gamma), and SVC C -- scored on the clean validation set
+        (leakage-free: the supervised UMAP only saw the fit set). Representations
+        (statevectors / RDM features) are computed once per (alpha, beta); gamma
+        and C are then cheap."""
         cfg = self.config
-        c_grid = cfg.tune_bandwidth or (cfg.encoding_scale,)
+        proj = cfg.kernel_type == "projected"
+        a_grid, b_grid = cfg.tune_alpha or (cfg.alpha_scale,), cfg.tune_beta or (cfg.beta_scale,)
+        g_grid = (cfg.tune_gamma or (cfg.projected_gamma,)) if proj else (1.0,)
         C_grid = cfg.tune_C or (cfg.svc_C,)
         y_fit_signed = np.where(y_fit == 1, 1.0, -1.0)
-        best = {"auc": -np.inf, "c": c_grid[0], "C": C_grid[0],
-                "val_scores": None, "kta": 0.0, "off": 0.0}
-        for c in c_grid:
-            qp = QuantumProcessor(cfg, bandwidth=c)
-            K_ff = np.clip((lambda K: (K + K.T) / 2.0)(qp.kernel(X_fit)), 0.0, 1.0)
-            K_vf = qp.kernel(X_val, X_fit)
-            off = K_ff[~np.eye(len(K_ff), dtype=bool)]
-            kta = self._kta(K_ff, y_fit_signed)
-            best_val_here = -np.inf
-            for C in C_grid:
-                svc = SVC(kernel="precomputed", C=C, class_weight=cfg.class_weight)
-                svc.fit(K_ff, y_fit)
-                val_scores = svc.decision_function(K_vf)
-                try:
-                    vauc = roc_auc_score(y_val, val_scores)
-                except ValueError:
-                    vauc = 0.5
-                best_val_here = max(best_val_here, vauc)
-                if vauc > best["auc"]:
-                    best.update(auc=vauc, c=c, C=C, val_scores=val_scores,
-                                kta=kta, off=float(off.mean()))
-            logger.info("  c=%-5.3g  KTA=%.3f off-diag mean=%.4g | best val AUC(C)=%.4f",
-                        c, kta, off.mean(), best_val_here)
-        logger.info("Selected bandwidth c=%.3g, C=%g (val AUC=%.4f)",
-                    best["c"], best["C"], best["auc"])
+        best = {"auc": -np.inf, "alpha": a_grid[0], "beta": b_grid[0], "gamma": g_grid[0],
+                "C": C_grid[0], "val_scores": None, "kta": 0.0, "off": 0.0, "gdiff": np.nan}
+
+        for a in a_grid:
+            for b in b_grid:
+                qp = QuantumProcessor(cfg, alpha=a, beta=b, pairs=pairs)
+                if proj:
+                    S_f, S_v = qp.states(X_fit), qp.states(X_val)
+                    F_f, F_v = qp.rdm_features(S_f), qp.rdm_features(S_v)
+                    base_w = qp.median_width(F_f)
+                    kernels = {g: (np.exp(-g * base_w * qp._sqdist(F_f, F_f)),
+                                   np.exp(-g * base_w * qp._sqdist(F_v, F_f))) for g in g_grid}
+                else:
+                    S_f, S_v = qp.states(X_fit), qp.states(X_val)
+                    Kff = np.clip(np.abs(S_f.conj() @ S_f.T) ** 2, 0.0, 1.0)
+                    Kvf = np.clip(np.abs(S_v.conj() @ S_f.T) ** 2, 0.0, 1.0)
+                    kernels = {1.0: (Kff, Kvf)}
+                for g, (K_ff, K_vf) in kernels.items():
+                    off = K_ff[~np.eye(len(K_ff), dtype=bool)]
+                    kta = self._kta(K_ff, y_fit_signed)
+                    for C in C_grid:
+                        svc = SVC(kernel="precomputed", C=C, class_weight=cfg.class_weight)
+                        svc.fit(K_ff, y_fit)
+                        try:
+                            vs = svc.decision_function(K_vf)
+                            vauc = roc_auc_score(y_val, vs)
+                        except ValueError:
+                            vs, vauc = np.zeros(len(y_val)), 0.5
+                        if vauc > best["auc"]:
+                            best.update(auc=vauc, alpha=a, beta=b, gamma=g, C=C,
+                                        val_scores=vs, kta=kta, off=float(off.mean()),
+                                        K_ff=K_ff)
+                logger.info("  alpha=%-4.2g beta=%-4.2g | off-diag mean=%.3g KTA=%.3f",
+                            a, b, K_ff[~np.eye(len(K_ff), dtype=bool)].mean(), kta)
+
+        # Geometric difference g(K_classical || K_quantum) on the fit block: is
+        # there ANY labeling of this data for which the quantum kernel could beat
+        # the classical RBF? (Huang et al. 2021). Large => potential advantage.
+        if cfg.geometric_difference and "K_ff" in best:
+            from sklearn.metrics.pairwise import rbf_kernel
+            Kc = rbf_kernel(X_fit, X_fit, gamma=1.0 / X_fit.shape[1])
+            best["gdiff"] = _geometric_difference(Kc, best["K_ff"])
+        logger.info("Selected alpha=%.3g beta=%.3g gamma=%.3g C=%g (val AUC=%.4f, "
+                    "g(K_C||K_Q)=%.2f)", best["alpha"], best["beta"], best["gamma"],
+                    best["C"], best["auc"], best["gdiff"])
         return best
 
     def run(self, smiles, labels, names=None) -> PipelineResult:
@@ -595,41 +689,46 @@ class ToxicityPipeline:
         E_all = self.embedder.embed(smiles_ord)
         E_fit, E_val, E_test = E_all[:n_fit], E_all[n_fit:n_train], E_all[n_train:]
 
-        # ---- Step 2: UMAP compression (supervised, fit on FIT labels only) -- #
-        logger.info("=== Step 2/5: UMAP topological compression ===")
+        # ---- Step 2: compression (supervised UMAP / PCA, fit on FIT only) --- #
+        logger.info("=== Step 2/5: topological compression (%s) ===", cfg.compressor)
         X_fit = self.compressor.fit_transform(E_fit, y_fit)
         X_val = self.compressor.transform(E_val)
         X_test = self.compressor.transform(E_test)
         X_all = np.vstack([X_fit, X_val, X_test])
 
-        # ---- Step 3+4: bandwidth/C selection on VAL, then final kernel ----- #
-        logger.info("=== Step 3/5: Quantum kernel + leakage-free selection ===")
-        best = self._select_hyperparams(X_fit, y_fit, X_val, y_val)
-        best_c, best_C, val_auc = best["c"], best["C"], best["auc"]
+        # entangling wiring (mutual-information edges are computed on fit features)
+        pairs = _wiring_pairs(cfg.n_qubits, cfg.entanglement, X_fit)
 
-        self.quantum = QuantumProcessor(cfg, bandwidth=best_c)
-        K_full = self.quantum.kernel(X_all)
+        # ---- Step 3+4: (alpha,beta,gamma,C) selection on VAL, then final kernel #
+        logger.info("=== Step 3/5: Quantum kernel + leakage-free selection ===")
+        best = self._select_hyperparams(X_fit, y_fit, X_val, y_val, pairs)
+        best_C, val_auc = best["C"], best["auc"]
+
+        self.quantum = QuantumProcessor(cfg, alpha=best["alpha"], beta=best["beta"], pairs=pairs)
+        # For the projected kernel, freeze the RBF width from the fit block so the
+        # full kernel uses the exact width selected on validation.
+        if cfg.kernel_type == "projected":
+            base_w = self.quantum.median_width(self.quantum.rdm_features(self.quantum.states(X_fit)))
+            K_full = self.quantum.kernel(X_all, gamma=best["gamma"] * base_w)
+        else:
+            K_full = self.quantum.kernel(X_all)
         K_full = np.clip((K_full + K_full.T) / 2.0, 0.0, 1.0)  # symmetrise
         K_fit = K_full[:n_fit, :n_fit]                         # fit-vs-fit (training)
         K_test_fit = K_full[n_train:, :n_fit]                  # test-vs-fit
 
-        # Kernel-health diagnostic: the off-diagonal distribution. Healthy kernels
-        # spread mass across ~[0.05, 0.9]; a spike at 0 => concentration (near
-        # identity), a spike at 1 => the map is too weak to separate anything.
+        # Kernel-health diagnostic: off-diagonal distribution + KTA + geometric
+        # difference vs a classical RBF (can any labeling favour the quantum kernel?).
         offdiag = K_full[~np.eye(len(K_full), dtype=bool)]
         pct = np.percentile(offdiag, [5, 25, 50, 75, 95])
-        logger.info("Kernel off-diagonal: mean=%.4g pct[5,25,50,75,95]=%s max=%.4g | KTA=%.4f",
-                    offdiag.mean(), np.round(pct, 4).tolist(), offdiag.max(), best["kta"])
+        logger.info("Kernel off-diagonal: mean=%.4g pct[5,25,50,75,95]=%s max=%.4g | "
+                    "KTA=%.4f  g(K_C||K_Q)=%.2f", offdiag.mean(),
+                    np.round(pct, 4).tolist(), offdiag.max(), best["kta"], best["gdiff"])
         if offdiag.mean() < 1e-3:
-            logger.warning(
-                "Quantum kernel is CONCENTRATED (near-identity): off-diagonal "
-                "mean=%.2g. The QSVC will not generalise. Reduce n_qubits (<=10), "
-                "feature_map_reps, and/or the bandwidth grid.", offdiag.mean())
-        elif offdiag.mean() > 0.98:
-            logger.warning(
-                "Quantum kernel is near-constant (~all ones): off-diagonal "
-                "mean=%.3g. The feature map is too weak; raise the bandwidth.",
-                offdiag.mean())
+            logger.warning("Quantum kernel is CONCENTRATED (near-identity, off-diag "
+                           "mean=%.2g): reduce n_qubits/reps or raise beta.", offdiag.mean())
+        elif offdiag.mean() > 0.98 and cfg.kernel_type == "fidelity":
+            logger.warning("Quantum kernel is near-constant (off-diag mean=%.3g): the "
+                           "feature map is too weak; raise alpha/beta.", offdiag.mean())
 
         # ---- Step 4: Stage 1 QSVC (train on FIT, threshold on VAL) --------- #
         logger.info("=== Step 4/5: Stage 1 - supervised QSVC triage ===")
@@ -698,7 +797,8 @@ class ToxicityPipeline:
             best_C=best_C, cv_auc_mean=float(val_auc), cv_auc_std=0.0,
             baseline=baseline, toxic_index=toxic_index, cluster_labels=cluster_labels,
             cluster_summary=cluster_summary, order=order, n_train=n_train, full_kernel=K_full,
-            bandwidth=float(best_c), kta=float(best["kta"]), offdiag_mean=float(offdiag.mean()),
+            alpha=float(best["alpha"]), beta=float(best["beta"]), gamma=float(best["gamma"]),
+            kta=float(best["kta"]), offdiag_mean=float(offdiag.mean()), gdiff=float(best["gdiff"]),
         )
 
     def _classical_baseline(self, E_fit, y_fit, E_val, y_val, E_test, y_test,
@@ -1126,6 +1226,39 @@ def load_known_drug_panel() -> tuple[list[str], np.ndarray, list[str]]:
 
 
 # --------------------------------------------------------------------------- #
+# Repeated-split evaluation (honest mean +/- CI)
+# --------------------------------------------------------------------------- #
+def repeated_evaluation(config, smiles, labels, names=None, seeds=(0, 1, 2, 3, 4)):
+    """Run the whole pipeline over several random splits and report test ROC-AUC
+    as mean +/- 95% CI for the quantum QSVC and every classical baseline.
+
+    With ~250 test points the AUC standard error is ~0.03, so a single split
+    cannot tell 0.78 from 0.79. Any claimed quantum-vs-classical difference must
+    survive this repeated protocol, not one seed.
+    """
+    from dataclasses import replace
+    rows: dict[str, list] = {}
+    for seed in seeds:
+        cfg = replace(config, random_state=int(seed))
+        res = ToxicityPipeline(cfg).run(smiles, labels, names)
+        rows.setdefault("quantum", []).append(res.roc_auc)
+        for name, m in (res.baseline or {}).items():
+            rows.setdefault(name, []).append(m["test_auc"])
+        logger.info("[seed %d] quantum test AUC=%.4f", seed, res.roc_auc)
+
+    print("\n" + "=" * 74)
+    print(f"REPEATED EVALUATION over {len(seeds)} splits -- test ROC-AUC (mean +/- 95% CI)")
+    print("=" * 74)
+    summary = {}
+    for name, vals in rows.items():
+        a = np.asarray(vals)
+        ci = 1.96 * a.std(ddof=1) / np.sqrt(len(a)) if len(a) > 1 else 0.0
+        summary[name] = (float(a.mean()), float(ci))
+        print(f"  {name:13s} {a.mean():.4f} +/- {ci:.4f}   (n={len(a)})")
+    return summary
+
+
+# --------------------------------------------------------------------------- #
 # Reporting helpers
 # --------------------------------------------------------------------------- #
 def print_report(result: PipelineResult) -> None:
@@ -1135,8 +1268,10 @@ def print_report(result: PipelineResult) -> None:
     print(cfg_line)
     print(result.report)
     print(f"Selected C        : {result.best_C:g}")
-    print(f"Bandwidth c       : {result.bandwidth:g}  (KTA={result.kta:.4f}, "
-          f"kernel off-diag mean={result.offdiag_mean:.4g})")
+    print(f"Feature map       : alpha={result.alpha:g} beta={result.beta:g} "
+          f"gamma={result.gamma:g}")
+    print(f"Kernel health     : off-diag mean={result.offdiag_mean:.4g}  KTA={result.kta:.4f}  "
+          f"g(K_C||K_Q)={result.gdiff:.2f}")
     print(f"Validation ROC-AUC: {result.cv_auc_mean:.4f}  (leakage-free holdout; used for selection)")
     print(f"Decision threshold: {result.threshold:.4f}")
     print(f"Test Accuracy     : {result.accuracy:.4f}")
