@@ -531,7 +531,8 @@ class ToxicityPipeline:
         # ---- classical baseline on raw embeddings ------------------------- #
         baseline = None
         if cfg.run_classical_baseline:
-            baseline = self._classical_baseline(E_train, y_train, E_test, y_test)
+            baseline = self._classical_baseline(E_train, y_train, E_test, y_test,
+                                                X_train=X_train, X_test=X_test)
 
         # ---- Step 5: Stage 2 mechanism sub-grouping ----------------------- #
         logger.info("=== Step 5/5: Stage 2 - spectral mechanism discovery ===")
@@ -564,40 +565,55 @@ class ToxicityPipeline:
             cluster_summary=cluster_summary, order=order, n_train=n_train, full_kernel=K_full,
         )
 
-    def _classical_baseline(self, E_train, y_train, E_test, y_test) -> dict:
-        """Classical RBF-SVC and logistic regression on the raw ChemBERTa
-        embeddings, with cross-validated AUC -- the reference ceiling."""
+    def _classical_baseline(self, E_train, y_train, E_test, y_test,
+                            X_train=None, X_test=None) -> dict:
+        """Classical baselines for a fair, layered comparison against the QSVC:
+
+        * ``rbf_umap8`` / ``linsvc_umap8`` -- classical SVC on the **same** UMAP
+          features the quantum kernel sees. This is the apples-to-apples control:
+          quantum-ZZ-kernel-on-8d vs classical-RBF-kernel-on-8d isolates what the
+          quantum feature map contributes, independent of UMAP compression.
+        * ``rbf_384`` / ``logreg_384`` -- on the raw ChemBERTa embeddings, i.e.
+          the ceiling you forgo by compressing to n_qubits dimensions.
+        """
         cfg = self.config
-        logger.info("Classical baselines on raw %d-d ChemBERTa embeddings ...", E_train.shape[1])
         out = {}
-        models = {
-            "rbf_svc": make_pipeline(
-                StandardScaler(),
-                SVC(kernel="rbf", C=10.0, gamma="scale",
-                    class_weight=cfg.class_weight),
-            ),
-            "logreg": make_pipeline(
-                StandardScaler(),
-                LogisticRegression(max_iter=2000, class_weight=cfg.class_weight),
-            ),
-        }
         skf = StratifiedKFold(cfg.cv_folds, shuffle=True, random_state=cfg.random_state)
-        for name, model in models.items():
-            cv_auc = cross_val_score(model, E_train, y_train, cv=skf, scoring="roc_auc")
-            model.fit(E_train, y_train)
-            score = (model.decision_function(E_test)
-                     if hasattr(model, "decision_function")
-                     else model.predict_proba(E_test)[:, 1])
-            pred = (score >= 0).astype(int) if name == "rbf_svc" else model.predict(E_test)
+
+        def _evaluate(name, model, tr, te):
+            cv_auc = cross_val_score(model, tr, y_train, cv=skf, scoring="roc_auc")
+            model.fit(tr, y_train)
+            score = (model.decision_function(te) if hasattr(model, "decision_function")
+                     else model.predict_proba(te)[:, 1])
+            pred = model.predict(te)
             out[name] = {
                 "cv_auc_mean": float(cv_auc.mean()), "cv_auc_std": float(cv_auc.std()),
                 "test_auc": float(roc_auc_score(y_test, score)),
                 "test_acc": float(accuracy_score(y_test, pred)),
                 "test_f1": float(f1_score(y_test, pred, zero_division=0)),
             }
-            logger.info("  %-8s CV AUC=%.4f+/-%.4f | test AUC=%.4f acc=%.4f f1=%.4f",
+            logger.info("  %-12s CV AUC=%.4f+/-%.4f | test AUC=%.4f acc=%.4f f1=%.4f",
                         name, out[name]["cv_auc_mean"], out[name]["cv_auc_std"],
                         out[name]["test_auc"], out[name]["test_acc"], out[name]["test_f1"])
+
+        # Fair, same-features control on the UMAP features (if provided).
+        if X_train is not None and X_test is not None:
+            logger.info("Classical baselines on the same %d-d UMAP features ...", X_train.shape[1])
+            _evaluate("rbf_umap8", make_pipeline(
+                StandardScaler(), SVC(kernel="rbf", C=10.0, gamma="scale",
+                                      class_weight=cfg.class_weight)), X_train, X_test)
+            _evaluate("linsvc_umap8", make_pipeline(
+                StandardScaler(), SVC(kernel="linear", C=1.0,
+                                      class_weight=cfg.class_weight)), X_train, X_test)
+
+        # Ceiling on the raw ChemBERTa embeddings.
+        logger.info("Classical baselines on raw %d-d ChemBERTa embeddings ...", E_train.shape[1])
+        _evaluate("rbf_384", make_pipeline(
+            StandardScaler(), SVC(kernel="rbf", C=10.0, gamma="scale",
+                                  class_weight=cfg.class_weight)), E_train, E_test)
+        _evaluate("logreg_384", make_pipeline(
+            StandardScaler(), LogisticRegression(max_iter=2000,
+                                                 class_weight=cfg.class_weight)), E_train, E_test)
         return out
 
 
@@ -760,7 +776,8 @@ def _from_tdc(tdc_name, cache_dir):
         ) from err
 
     cache_dir = cache_dir or _default_cache_dir()
-    candidates = [tdc_name, tdc_name.lower(), "herg_karim", "hERG_Karim", "hERG"]
+    # Prefer the larger Karim set; keep the small Wang 'hERG' only as last resort.
+    candidates = [tdc_name, tdc_name.lower(), "herg_karim", "hERG_Karim"]
 
     # Auto-discover the exact names this PyTDC version registers for Tox, and
     # prefer a hERG-Karim match. Falls back silently if the util API differs.
@@ -768,11 +785,13 @@ def _from_tdc(tdc_name, cache_dir):
     try:
         from tdc.utils import retrieve_dataset_names
         valid = retrieve_dataset_names("Tox")
-        pref = [v for v in valid if "herg" in v.lower() and "karim" in v.lower()]
-        pref += [v for v in valid if "herg" in v.lower() and "central" not in v.lower()]
-        candidates = pref + candidates
+        logger.info("TDC registered Tox datasets: %s", valid)
+        karim = [v for v in valid if "herg" in v.lower() and "karim" in v.lower()]
+        wang = [v for v in valid if "herg" in v.lower() and "karim" not in v.lower()
+                and "central" not in v.lower()]
+        candidates = karim + candidates + wang  # Karim-like first, Wang last
     except Exception:  # noqa: BLE001 - discovery is best-effort
-        pass
+        candidates = candidates + ["hERG"]
 
     last_err = None
     for name in dict.fromkeys(candidates):  # de-dupe, preserve order
@@ -780,7 +799,16 @@ def _from_tdc(tdc_name, cache_dir):
             logger.info("Loading official TDC dataset '%s' ...", name)
             data = Tox(name=name, path=cache_dir)
             df = data.get_data()  # columns: Drug_ID, Drug (SMILES), Y (0/1)
-            return df["Drug"].astype(str).tolist(), df["Y"].astype(int).to_numpy()
+            smiles = df["Drug"].astype(str).tolist()
+            labels = df["Y"].astype(int).to_numpy()
+            if len(smiles) < 1000 and any("karim" in c.lower() for c in candidates):
+                logger.warning(
+                    "Loaded TDC dataset '%s' with only %d molecules (this is the "
+                    "small Wang hERG set, not the ~13,445-molecule Karim set). Your "
+                    "PyTDC version does not expose 'herg_karim' by name. For the "
+                    "large set, download its CSV and pass "
+                    "load_herg_dataset(local_path=...).", name, len(smiles))
+            return smiles, labels
         except Exception as err:  # noqa: BLE001 - try the next candidate name
             last_err = err
 
@@ -935,13 +963,14 @@ def print_report(result: PipelineResult) -> None:
 
     if result.baseline:
         print("\n" + cfg_line)
-        print("CLASSICAL BASELINE (raw 384-d ChemBERTa embeddings)")
+        print("QUANTUM vs CLASSICAL  (same 8-d UMAP features = fair control;")
+        print("                       *_384 = ceiling on raw ChemBERTa embeddings)")
         print(cfg_line)
-        print(f"{'model':10s} {'CV ROC-AUC':>18s} {'test AUC':>10s} {'test acc':>10s} {'test f1':>9s}")
-        print(f"{'quantum':10s} {result.cv_auc_mean:>10.4f}+/-{result.cv_auc_std:<5.4f} "
+        print(f"{'model':13s} {'CV ROC-AUC':>18s} {'test AUC':>10s} {'test acc':>10s} {'test f1':>9s}")
+        print(f"{'quantum(8d)':13s} {result.cv_auc_mean:>10.4f}+/-{result.cv_auc_std:<5.4f} "
               f"{result.roc_auc:>10.4f} {result.accuracy:>10.4f} {result.f1:>9.4f}")
         for name, m in result.baseline.items():
-            print(f"{name:10s} {m['cv_auc_mean']:>10.4f}+/-{m['cv_auc_std']:<5.4f} "
+            print(f"{name:13s} {m['cv_auc_mean']:>10.4f}+/-{m['cv_auc_std']:<5.4f} "
                   f"{m['test_auc']:>10.4f} {m['test_acc']:>10.4f} {m['test_f1']:>9.4f}")
 
     print("\n" + cfg_line)
