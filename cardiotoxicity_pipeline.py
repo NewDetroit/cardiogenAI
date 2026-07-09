@@ -32,12 +32,12 @@ Real data, real model
 ----------------------
 * **Model:** the pretrained ChemBERTa chemical language model is loaded from the
   Hugging Face Hub (no random-initialised stand-in).
-* **Data:** an official, large hERG cardiotoxicity benchmark from Therapeutics
-  Data Commons -- ``hERG_Karim`` (Karim et al. 2021, ~13,445 molecules) or
-  ``hERG`` (Wang et al. 2016, ~655) -- with binary hERG-blocker labels, or any
-  CSV you download (``local_path``). It is (optionally) subsampled to a balanced
-  working set. A curated panel of 30 named marketed drugs is also provided for
-  interpretable sanity checks.
+* **Data:** an official hERG cardiotoxicity dataset from Therapeutics Data
+  Commons -- by default **hERGCentral** (``herg_central``, label ``hERG_inhib``:
+  a ~306,893-molecule electrophysiology screen, binary blockade) -- or
+  ``herg_karim`` / ``hERG``, or any CSV you download (``local_path``). It is
+  subsampled to a balanced working set for the O(N^2) quantum kernel. A curated
+  panel of 30 named marketed drugs is also provided for interpretable checks.
 
 Because a fidelity quantum kernel is O(N^2), the quantum stages run on a
 balanced subsample (configurable). The classical baseline and cross-validation
@@ -132,13 +132,13 @@ class PipelineConfig:
     pooling: str = "mean"  # "mean" (masked mean), "cls", or "pooler"
 
     # --- Step 2: UMAP compression ---
-    n_qubits: int = 8               # UMAP output dim == number of qubits (8 or 16)
+    n_qubits: int = 16              # UMAP output dim == number of qubits (8 or 16)
     umap_n_neighbors: int = 15
     umap_min_dist: float = 0.1
     umap_metric: str = "cosine"
 
     # --- Step 3: Quantum feature map / kernel ---
-    feature_map_reps: int = 2
+    feature_map_reps: int = 3
     entanglement: str = "linear"
     use_fidelity_primitive: bool = False  # True -> Qiskit FidelityQuantumKernel
 
@@ -154,8 +154,11 @@ class PipelineConfig:
     n_clusters: int = 3
 
     # --- Data / split / reproducibility ---
-    n_samples: int = 800                  # balanced hERG working-set size
-    max_quantum_samples: int = 1500       # hard cap on molecules in the quantum kernel
+    # NOTE: the exact statevector kernel holds 2**n_qubits complex amplitudes per
+    # molecule, so peak memory ~ n_samples * 2**n_qubits * 16 bytes. At n_qubits=16
+    # keep the working set modest (a few hundred to ~1000).
+    n_samples: int = 408                  # balanced hERG working-set size
+    max_quantum_samples: int = 1000       # hard cap on molecules in the quantum kernel
     test_size: float = 0.25
     random_state: int = 42
 
@@ -569,10 +572,11 @@ class ToxicityPipeline:
                             X_train=None, X_test=None) -> dict:
         """Classical baselines for a fair, layered comparison against the QSVC:
 
-        * ``rbf_umap8`` / ``linsvc_umap8`` -- classical SVC on the **same** UMAP
+        * ``rbf_umap`` / ``linsvc_umap`` -- classical SVC on the **same** UMAP
           features the quantum kernel sees. This is the apples-to-apples control:
-          quantum-ZZ-kernel-on-8d vs classical-RBF-kernel-on-8d isolates what the
-          quantum feature map contributes, independent of UMAP compression.
+          quantum ZZ kernel vs classical RBF kernel on identical n_qubits-d
+          inputs isolates what the quantum feature map contributes, independent
+          of UMAP compression.
         * ``rbf_384`` / ``logreg_384`` -- on the raw ChemBERTa embeddings, i.e.
           the ceiling you forgo by compressing to n_qubits dimensions.
         """
@@ -599,10 +603,10 @@ class ToxicityPipeline:
         # Fair, same-features control on the UMAP features (if provided).
         if X_train is not None and X_test is not None:
             logger.info("Classical baselines on the same %d-d UMAP features ...", X_train.shape[1])
-            _evaluate("rbf_umap8", make_pipeline(
+            _evaluate("rbf_umap", make_pipeline(
                 StandardScaler(), SVC(kernel="rbf", C=10.0, gamma="scale",
                                       class_weight=cfg.class_weight)), X_train, X_test)
-            _evaluate("linsvc_umap8", make_pipeline(
+            _evaluate("linsvc_umap", make_pipeline(
                 StandardScaler(), SVC(kernel="linear", C=1.0,
                                       class_weight=cfg.class_weight)), X_train, X_test)
 
@@ -659,13 +663,16 @@ def _characterise_clusters(smiles, labels, n_clusters) -> dict:
 # Data loading -- official hERG cardiotoxicity datasets
 # --------------------------------------------------------------------------- #
 # Recommended official source: Therapeutics Data Commons (TDC).
-#     https://tdcommons.ai/single_pred_tasks/tox/#herg-blockers-karim-et-al
+#     https://tdcommons.ai/single_pred_tasks/tox/
 #     pip install PyTDC
 #     from tdc.single_pred import Tox
+#     # hERGCentral -- huge electrophysiology screen (~306,893 drugs), multi-label:
+#     Tox(name="herg_central", label_name="hERG_inhib")  # binary blockade (default)
+#     Tox(name="herg_central", label_name="hERG_at_1uM")  # % inhibition (regression)
 #     Tox(name="hERG")        -> Wang et al. 2016   (~655 drugs)
-#     Tox(name="herg_karim")  -> Karim et al. 2021  (~13,445 drugs)  # lowercase!
+#     Tox(name="herg_karim")  -> Karim et al. 2021  (~13,445 drugs, if exposed)
 # get_data() returns a DataFrame with columns: Drug_ID, Drug (SMILES), Y (label;
-# 1 = hERG blocker / cardiotoxic, 0 = non-blocker).
+# for hERG_inhib: 1 = hERG blocker / cardiotoxic, 0 = non-blocker).
 #
 # Alternatively, pass ``local_path`` pointing at any CSV you downloaded (from
 # TDC, ChEMBL target CHEMBL240, a Kaggle mirror, etc.). The SMILES and label
@@ -755,14 +762,32 @@ def _from_local(path, smiles_col, label_col):
     return df[s_col].astype(str).tolist(), df[l_col].astype(int).to_numpy()
 
 
-def _from_tdc(tdc_name, cache_dir):
+def _resolve_tdc_label(dataset_name, label_name):
+    """Match a requested TDC ``label_name`` (case-insensitively) against the
+    labels the dataset actually exposes. Only multi-label datasets (e.g.
+    ``herg_central``, ``tox21``) accept a label_name."""
+    if label_name is None:
+        return None
+    try:
+        from tdc.utils import retrieve_label_name_list
+        avail = retrieve_label_name_list(dataset_name.lower())
+        for lab in avail:
+            if lab.lower() == label_name.lower():
+                return lab
+        logger.warning("Label '%s' not found for '%s'; available: %s. "
+                       "Passing it through unchanged.", label_name, dataset_name, avail)
+    except Exception:  # noqa: BLE001 - best-effort; let TDC validate
+        pass
+    return label_name
+
+
+def _from_tdc(tdc_name, cache_dir, label_name=None):
     """Load an official hERG dataset via Therapeutics Data Commons (PyTDC).
 
-    TDC dataset names are matched case-insensitively but must exist in the
-    installed PyTDC version. The canonical hERG-Karim name is the lowercase
-    ``herg_karim`` (per the TDC dataset card); older/other versions vary, so we
-    also auto-discover the registered Tox names and try sensible candidates
-    before giving up.
+    Handles single-label sets (``herg``, ``herg_karim``) and multi-label sets
+    (``herg_central``, which needs a ``label_name`` such as ``hERG_inhib``).
+    TDC names are matched case-insensitively; the exact registered name is
+    auto-discovered so casing/variants are tolerated.
     """
     try:
         from tdc.single_pred import Tox
@@ -776,44 +801,49 @@ def _from_tdc(tdc_name, cache_dir):
         ) from err
 
     cache_dir = cache_dir or _default_cache_dir()
-    # Prefer the larger Karim set; keep the small Wang 'hERG' only as last resort.
-    candidates = [tdc_name, tdc_name.lower(), "herg_karim", "hERG_Karim"]
+    req = tdc_name.lower().replace("-", "_")
+    candidates = [tdc_name, tdc_name.lower()]
 
-    # Auto-discover the exact names this PyTDC version registers for Tox, and
-    # prefer a hERG-Karim match. Falls back silently if the util API differs.
+    # Auto-discover the exact registered names; prefer ones matching the request.
     valid = None
     try:
         from tdc.utils import retrieve_dataset_names
         valid = retrieve_dataset_names("Tox")
         logger.info("TDC registered Tox datasets: %s", valid)
-        karim = [v for v in valid if "herg" in v.lower() and "karim" in v.lower()]
-        wang = [v for v in valid if "herg" in v.lower() and "karim" not in v.lower()
-                and "central" not in v.lower()]
-        candidates = karim + candidates + wang  # Karim-like first, Wang last
+        exact = [v for v in valid if v.lower().replace("-", "_") == req]
+        partial = [v for v in valid if req in v.lower() or v.lower() in req]
+        # If the user asked for Karim but this build lacks it, do NOT silently
+        # fall back to the tiny Wang set -- surface that clearly instead.
+        candidates = exact + partial + candidates
     except Exception:  # noqa: BLE001 - discovery is best-effort
-        candidates = candidates + ["hERG"]
+        pass
 
     last_err = None
     for name in dict.fromkeys(candidates):  # de-dupe, preserve order
         try:
-            logger.info("Loading official TDC dataset '%s' ...", name)
-            data = Tox(name=name, path=cache_dir)
-            df = data.get_data()  # columns: Drug_ID, Drug (SMILES), Y (0/1)
+            resolved_label = _resolve_tdc_label(name, label_name)
+            kwargs = {"name": name, "path": cache_dir}
+            if resolved_label is not None:
+                kwargs["label_name"] = resolved_label
+            logger.info("Loading official TDC dataset '%s'%s ...", name,
+                        f" (label='{resolved_label}')" if resolved_label else "")
+            df = Tox(**kwargs).get_data()  # columns: Drug_ID, Drug (SMILES), Y
             smiles = df["Drug"].astype(str).tolist()
             labels = df["Y"].astype(int).to_numpy()
-            if len(smiles) < 1000 and any("karim" in c.lower() for c in candidates):
+            logger.info("TDC '%s': %d molecules (label positives=%d).",
+                        name, len(smiles), int(labels.sum()))
+            if "karim" in req and len(smiles) < 1000:
                 logger.warning(
-                    "Loaded TDC dataset '%s' with only %d molecules (this is the "
-                    "small Wang hERG set, not the ~13,445-molecule Karim set). Your "
-                    "PyTDC version does not expose 'herg_karim' by name. For the "
-                    "large set, download its CSV and pass "
-                    "load_herg_dataset(local_path=...).", name, len(smiles))
+                    "Requested Karim (~13,445) but loaded only %d molecules -- this "
+                    "PyTDC build does not expose 'herg_karim' by name. Consider "
+                    "tdc_name='herg_central' (label 'hERG_inhib') or local_path=.",
+                    len(smiles))
             return smiles, labels
         except Exception as err:  # noqa: BLE001 - try the next candidate name
             last_err = err
 
     raise RuntimeError(
-        f"Could not load an hERG dataset from TDC. Registered Tox names: "
+        f"Could not load TDC dataset for '{tdc_name}'. Registered Tox names: "
         f"{valid}. Tried {list(dict.fromkeys(candidates))}. Last error: {last_err}. "
         "You can instead download an hERG CSV and pass "
         "load_herg_dataset(local_path='herg.csv')."
@@ -821,11 +851,12 @@ def _from_tdc(tdc_name, cache_dir):
 
 
 def load_herg_dataset(
-    n_samples: int | None = 800,
+    n_samples: int | None = 408,
     balanced: bool = True,
     *,
     source: str = "tdc",
-    tdc_name: str = "herg_karim",
+    tdc_name: str = "herg_central",
+    tdc_label_name: str | None = "hERG_inhib",
     local_path: str | None = None,
     smiles_col: str | None = None,
     label_col: str | None = None,
@@ -845,38 +876,48 @@ def load_herg_dataset(
         'smiles'/'drug' and 'y'/'activity'/'label'); override with
         ``smiles_col`` / ``label_col``. Takes precedence over ``source``.
     source="tdc" (default) : Therapeutics Data Commons (needs ``pip install PyTDC``).
-        ``tdc_name="herg_karim"`` -> Karim et al. 2021 (~13,445 molecules);
-        ``tdc_name="hERG"``       -> Wang et al. 2016 (~655 molecules).
+        ``tdc_name="herg_central"`` + ``tdc_label_name="hERG_inhib"`` (default) ->
+            hERGCentral binary blockade task (~306,893 molecules; label 1 if the
+            compound blocks hERG, i.e. hERG_at_10uM < -50).
+        ``tdc_name="herg_karim"`` -> Karim et al. 2021 (~13,445; if your PyTDC
+            build exposes it); ``tdc_name="hERG"`` -> Wang et al. 2016 (~655).
         The exact registered name is auto-discovered, so casing variants are OK.
+    tdc_label_name : str or None
+        For multi-label TDC sets (hERGCentral: ``hERG_at_1uM``, ``hERG_at_10uM``,
+        ``hERG_inhib``). Ignored for single-label sets.
 
     Parameters
     ----------
     n_samples : int or None
         If given, return a (class-balanced if ``balanced``) random subsample of
         this size -- appropriate for the O(N^2) quantum kernel. ``None`` returns
-        the full dataset.
+        the full dataset. (hERGCentral is huge, so keep this modest.)
 
     Returns (smiles, labels, names).
     """
     if local_path is not None:
         smiles, labels = _from_local(local_path, smiles_col, label_col)
     elif source == "tdc":
-        smiles, labels = _from_tdc(tdc_name, cache_dir)
+        smiles, labels = _from_tdc(tdc_name, cache_dir, label_name=tdc_label_name)
     else:
         raise ValueError(f"Unknown source '{source}'. Use source='tdc' or pass local_path=...")
-
-    if validate:
-        smiles, labels = _filter_valid_smiles(smiles, labels)
 
     logger.info("Loaded hERG dataset: %d molecules (blockers=%d, non-blockers=%d)",
                 len(smiles), int(labels.sum()), int((labels == 0).sum()))
 
+    # Subsample FIRST (hERGCentral has ~307k rows -- validating them all would be
+    # wastefully slow), then validate the (small) working set.
     if n_samples is not None and n_samples < len(smiles):
         idx = (_balanced_subsample(labels, n_samples, random_state) if balanced
                else np.random.default_rng(random_state).choice(len(smiles), n_samples, replace=False))
         smiles = [smiles[i] for i in idx]
         labels = labels[idx]
         logger.info("Subsampled to %d molecules (balanced=%s).", len(smiles), balanced)
+
+    if validate:
+        smiles, labels = _filter_valid_smiles(smiles, labels)
+        logger.info("After SMILES validation: %d molecules (blockers=%d).",
+                    len(smiles), int(labels.sum()))
 
     names = [f"hERG_{i:05d}" for i in range(len(smiles))]
     return smiles, labels, names
@@ -963,11 +1004,11 @@ def print_report(result: PipelineResult) -> None:
 
     if result.baseline:
         print("\n" + cfg_line)
-        print("QUANTUM vs CLASSICAL  (same 8-d UMAP features = fair control;")
-        print("                       *_384 = ceiling on raw ChemBERTa embeddings)")
+        print("QUANTUM vs CLASSICAL  (*_umap = same UMAP features as quantum = fair")
+        print("                       control; *_384 = ceiling on raw ChemBERTa embeddings)")
         print(cfg_line)
         print(f"{'model':13s} {'CV ROC-AUC':>18s} {'test AUC':>10s} {'test acc':>10s} {'test f1':>9s}")
-        print(f"{'quantum(8d)':13s} {result.cv_auc_mean:>10.4f}+/-{result.cv_auc_std:<5.4f} "
+        print(f"{'quantum':13s} {result.cv_auc_mean:>10.4f}+/-{result.cv_auc_std:<5.4f} "
               f"{result.roc_auc:>10.4f} {result.accuracy:>10.4f} {result.f1:>9.4f}")
         for name, m in result.baseline.items():
             print(f"{name:13s} {m['cv_auc_mean']:>10.4f}+/-{m['cv_auc_std']:<5.4f} "
@@ -993,13 +1034,14 @@ def print_report(result: PipelineResult) -> None:
 # Demo entry point
 # --------------------------------------------------------------------------- #
 def main() -> None:
-    config = PipelineConfig(n_qubits=8, n_clusters=3, n_samples=800)
+    config = PipelineConfig(n_qubits=16, n_clusters=3, n_samples=408)
     np.random.seed(config.random_state)
     torch.manual_seed(config.random_state)
 
-    logger.info("Loading real hERG cardiotoxicity dataset ...")
+    logger.info("Loading official hERGCentral dataset (label 'hERG_inhib') ...")
     smiles, labels, names = load_herg_dataset(
-        n_samples=config.n_samples, random_state=config.random_state
+        source="tdc", tdc_name="herg_central", tdc_label_name="hERG_inhib",
+        n_samples=config.n_samples, random_state=config.random_state,
     )
 
     result = ToxicityPipeline(config).run(smiles, labels, names)
