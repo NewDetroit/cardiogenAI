@@ -8,3 +8,8 @@ transformers>=4.35
 torch>=2.0
 numpy>=1.24
 scipy>=1.10
+
+# Optional: only needed if you want to (re)validate / canonicalise SMILES.
+# The shipped dataset already ships RDKit-canonical SMILES, so the pipeline
+# itself does not import rdkit at runtime.
+# rdkit>=2023.9
