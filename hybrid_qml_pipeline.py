@@ -56,10 +56,23 @@ from sklearn.preprocessing import MinMaxScaler
 from sklearn.svm import SVC
 from transformers import AutoModel, AutoTokenizer
 
-from qiskit.circuit.library import ZZFeatureMap
-from qiskit.primitives import Sampler
-from qiskit_algorithms.state_fidelities import ComputeUncompute
 from qiskit_machine_learning.kernels import FidelityQuantumKernel
+
+# --- Qiskit version compatibility layer ------------------------------------ #
+# Qiskit 2.x removed the V1 ``Sampler`` primitive and deprecated the
+# ``ZZFeatureMap`` class in favor of the ``zz_feature_map`` function. The
+# imports below prefer the modern API and fall back for Qiskit 1.x installs.
+try:  # Qiskit >= 1.3
+    from qiskit.circuit.library import zz_feature_map as _zz_feature_map
+except ImportError:  # Qiskit < 1.3
+    from qiskit.circuit.library import ZZFeatureMap as _zz_feature_map
+
+try:  # Qiskit 2.x: V2 primitives + fidelity shipped with qiskit-machine-learning
+    from qiskit.primitives import StatevectorSampler as _Sampler
+    from qiskit_machine_learning.state_fidelities import ComputeUncompute
+except ImportError:  # Qiskit 1.x: V1 Sampler + qiskit-algorithms fidelity
+    from qiskit.primitives import Sampler as _Sampler
+    from qiskit_algorithms.state_fidelities import ComputeUncompute
 
 logging.basicConfig(
     level=logging.INFO,
@@ -109,6 +122,12 @@ class DataEmbedder:
 
     Tokenizes input strings and extracts the final-layer pooler output
     (shape: (N_samples, Hidden_Dim), e.g. 768 for bert-base-uncased).
+
+    Offline fallback: if the pretrained weights cannot be fetched from the
+    HuggingFace hub (air-gapped/sandboxed environments), a WordPiece
+    tokenizer is trained on the input corpus and paired with a
+    randomly-initialised compact ``BertModel``. The interface and the
+    pooler-output extraction are identical in both modes.
     """
 
     def __init__(self, config: PipelineConfig):
@@ -119,15 +138,73 @@ class DataEmbedder:
             config.model_name,
             self.device,
         )
-        self.tokenizer = AutoTokenizer.from_pretrained(config.model_name)
-        self.model = AutoModel.from_pretrained(config.model_name).to(self.device)
+        try:
+            self.tokenizer = AutoTokenizer.from_pretrained(config.model_name)
+            self.model = AutoModel.from_pretrained(config.model_name).to(self.device)
+            self.model.eval()
+            self.offline = False
+        except OSError as err:
+            logger.warning(
+                "Could not load '%s' from the HuggingFace hub (%s). "
+                "Falling back to an offline randomly-initialised BERT with a "
+                "corpus-trained WordPiece tokenizer.",
+                config.model_name,
+                err,
+            )
+            self.tokenizer = None  # built lazily from the first corpus seen
+            self.model = None
+            self.offline = True
+
+    def _build_offline_stack(self, texts: list[str]) -> None:
+        """Train a WordPiece tokenizer on `texts` and pair it with a compact,
+        randomly-initialised BERT. Used only when the hub is unreachable."""
+        from tokenizers import Tokenizer, models, normalizers, pre_tokenizers, processors
+        from tokenizers.trainers import WordPieceTrainer
+        from transformers import BertConfig, BertModel, PreTrainedTokenizerFast
+
+        specials = ["[PAD]", "[UNK]", "[CLS]", "[SEP]", "[MASK]"]
+        raw = Tokenizer(models.WordPiece(unk_token="[UNK]"))
+        raw.normalizer = normalizers.BertNormalizer(lowercase=True)
+        raw.pre_tokenizer = pre_tokenizers.BertPreTokenizer()
+        raw.train_from_iterator(
+            texts, WordPieceTrainer(vocab_size=2000, special_tokens=specials)
+        )
+        raw.post_processor = processors.BertProcessing(
+            sep=("[SEP]", raw.token_to_id("[SEP]")),
+            cls=("[CLS]", raw.token_to_id("[CLS]")),
+        )
+        self.tokenizer = PreTrainedTokenizerFast(
+            tokenizer_object=raw,
+            pad_token="[PAD]",
+            unk_token="[UNK]",
+            cls_token="[CLS]",
+            sep_token="[SEP]",
+            mask_token="[MASK]",
+        )
+        torch.manual_seed(self.config.random_state)
+        bert_config = BertConfig(
+            vocab_size=self.tokenizer.vocab_size,
+            hidden_size=128,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            intermediate_size=256,
+            max_position_embeddings=self.config.max_token_length,
+        )
+        self.model = BertModel(bert_config).to(self.device)
         self.model.eval()
+        logger.info(
+            "Offline embedder ready: vocab=%d, hidden_dim=%d",
+            self.tokenizer.vocab_size,
+            bert_config.hidden_size,
+        )
 
     @torch.no_grad()
     def embed(self, texts: list[str]) -> np.ndarray:
         """Embed a list of raw strings into a dense (N, Hidden_Dim) array."""
         if not texts:
             raise ValueError("DataEmbedder.embed received an empty text list.")
+        if self.offline and self.model is None:
+            self._build_offline_stack(texts)
 
         batches: list[np.ndarray] = []
         bs = self.config.embedding_batch_size
@@ -213,12 +290,12 @@ class QuantumProcessor:
 
     def __init__(self, config: PipelineConfig):
         self.config = config
-        self.feature_map = ZZFeatureMap(
+        self.feature_map = _zz_feature_map(
             feature_dimension=config.n_qubits,
             reps=config.feature_map_reps,
             entanglement=config.entanglement,
         )
-        sampler = Sampler()  # local reference simulator primitive
+        sampler = _Sampler()  # local statevector simulator primitive
         fidelity = ComputeUncompute(sampler=sampler)
         self.kernel = FidelityQuantumKernel(
             feature_map=self.feature_map,
@@ -266,8 +343,8 @@ class PipelineResult:
     report: str
     anomaly_indices: np.ndarray            # test-set indices predicted as class 1
     cluster_labels: np.ndarray | None      # sub-cluster id per anomaly, or None
-    train_kernel: np.ndarray = field(repr=False, default=None)
-    test_kernel: np.ndarray = field(repr=False, default=None)
+    train_kernel: np.ndarray | None = field(repr=False, default=None)
+    test_kernel: np.ndarray | None = field(repr=False, default=None)
 
 
 class HybridPipeline:
@@ -286,7 +363,6 @@ class HybridPipeline:
         self.classifier = SVC(
             kernel="precomputed",
             C=self.config.svc_C,
-            probability=True,
             random_state=self.config.random_state,
         )
 

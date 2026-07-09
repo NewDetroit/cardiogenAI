@@ -87,6 +87,14 @@ print(result.cluster_labels)    # Stage 2 sub-cluster id per anomaly
 | `QuantumProcessor` | ZZFeatureMap + fidelity kernel matrix evaluation |
 | `HybridPipeline` | Orchestrates Steps 1–5, returns `PipelineResult` |
 
-All quantum computation runs locally through `qiskit.primitives.Sampler`
-(statevector simulation) — no QPU account needed. Point the
+All quantum computation runs locally through Qiskit's Sampler primitive
+(`StatevectorSampler` on Qiskit 2.x, `Sampler` on 1.x — a small
+compatibility layer picks the right one) — no QPU account needed. Point the
 `FidelityQuantumKernel` at a hardware-backed sampler to run on real devices.
+
+**Offline note:** if `bert-base-uncased` cannot be fetched from the
+HuggingFace hub (air-gapped environments), `DataEmbedder` automatically
+falls back to a corpus-trained WordPiece tokenizer paired with a
+randomly-initialised compact `BertModel`, so the demo still runs
+end-to-end. With hub access, the real pretrained pooler embeddings are
+used.
