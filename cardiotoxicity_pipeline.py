@@ -647,7 +647,7 @@ def _characterise_clusters(smiles, labels, n_clusters) -> dict:
 #     pip install PyTDC
 #     from tdc.single_pred import Tox
 #     Tox(name="hERG")        -> Wang et al. 2016   (~655 drugs)
-#     Tox(name="hERG_Karim")  -> Karim et al. 2021  (~13,445 drugs)
+#     Tox(name="herg_karim")  -> Karim et al. 2021  (~13,445 drugs)  # lowercase!
 # get_data() returns a DataFrame with columns: Drug_ID, Drug (SMILES), Y (label;
 # 1 = hERG blocker / cardiotoxic, 0 = non-blocker).
 #
@@ -740,7 +740,14 @@ def _from_local(path, smiles_col, label_col):
 
 
 def _from_tdc(tdc_name, cache_dir):
-    """Load an official hERG dataset via Therapeutics Data Commons (PyTDC)."""
+    """Load an official hERG dataset via Therapeutics Data Commons (PyTDC).
+
+    TDC dataset names are matched case-insensitively but must exist in the
+    installed PyTDC version. The canonical hERG-Karim name is the lowercase
+    ``herg_karim`` (per the TDC dataset card); older/other versions vary, so we
+    also auto-discover the registered Tox names and try sensible candidates
+    before giving up.
+    """
     try:
         from tdc.single_pred import Tox
     except ImportError as err:
@@ -751,10 +758,38 @@ def _from_tdc(tdc_name, cache_dir):
             "load_herg_dataset(local_path='herg.csv'). "
             "Official dataset: https://tdcommons.ai/single_pred_tasks/tox/"
         ) from err
-    logger.info("Loading official TDC dataset '%s' ...", tdc_name)
-    data = Tox(name=tdc_name, path=cache_dir or _default_cache_dir())
-    df = data.get_data()  # columns: Drug_ID, Drug (SMILES), Y (0/1)
-    return df["Drug"].astype(str).tolist(), df["Y"].astype(int).to_numpy()
+
+    cache_dir = cache_dir or _default_cache_dir()
+    candidates = [tdc_name, tdc_name.lower(), "herg_karim", "hERG_Karim", "hERG"]
+
+    # Auto-discover the exact names this PyTDC version registers for Tox, and
+    # prefer a hERG-Karim match. Falls back silently if the util API differs.
+    valid = None
+    try:
+        from tdc.utils import retrieve_dataset_names
+        valid = retrieve_dataset_names("Tox")
+        pref = [v for v in valid if "herg" in v.lower() and "karim" in v.lower()]
+        pref += [v for v in valid if "herg" in v.lower() and "central" not in v.lower()]
+        candidates = pref + candidates
+    except Exception:  # noqa: BLE001 - discovery is best-effort
+        pass
+
+    last_err = None
+    for name in dict.fromkeys(candidates):  # de-dupe, preserve order
+        try:
+            logger.info("Loading official TDC dataset '%s' ...", name)
+            data = Tox(name=name, path=cache_dir)
+            df = data.get_data()  # columns: Drug_ID, Drug (SMILES), Y (0/1)
+            return df["Drug"].astype(str).tolist(), df["Y"].astype(int).to_numpy()
+        except Exception as err:  # noqa: BLE001 - try the next candidate name
+            last_err = err
+
+    raise RuntimeError(
+        f"Could not load an hERG dataset from TDC. Registered Tox names: "
+        f"{valid}. Tried {list(dict.fromkeys(candidates))}. Last error: {last_err}. "
+        "You can instead download an hERG CSV and pass "
+        "load_herg_dataset(local_path='herg.csv')."
+    )
 
 
 def load_herg_dataset(
@@ -762,7 +797,7 @@ def load_herg_dataset(
     balanced: bool = True,
     *,
     source: str = "tdc",
-    tdc_name: str = "hERG_Karim",
+    tdc_name: str = "herg_karim",
     local_path: str | None = None,
     smiles_col: str | None = None,
     label_col: str | None = None,
@@ -782,8 +817,9 @@ def load_herg_dataset(
         'smiles'/'drug' and 'y'/'activity'/'label'); override with
         ``smiles_col`` / ``label_col``. Takes precedence over ``source``.
     source="tdc" (default) : Therapeutics Data Commons (needs ``pip install PyTDC``).
-        ``tdc_name="hERG_Karim"`` -> Karim et al. 2021 (~13,445 molecules);
+        ``tdc_name="herg_karim"`` -> Karim et al. 2021 (~13,445 molecules);
         ``tdc_name="hERG"``       -> Wang et al. 2016 (~655 molecules).
+        The exact registered name is auto-discovered, so casing variants are OK.
 
     Parameters
     ----------

@@ -40,7 +40,7 @@ SMILES strings
 - **Real, large, official dataset.** `load_herg_dataset()` loads an official
   hERG blockers benchmark from **[Therapeutics Data Commons
   (TDC)](https://tdcommons.ai/single_pred_tasks/tox/)** — by default
-  `hERG_Karim` (Karim et al. 2021, **~13,445 molecules**); `hERG` (Wang et al.
+  `herg_karim` (Karim et al. 2021, **~13,445 molecules**); `hERG` (Wang et al.
   2016, ~655 molecules) is also available. Invalid SMILES are dropped with RDKit
   and a **class-balanced** working subsample is drawn for the (O(N²)) quantum
   kernel. A quick fingerprint baseline puts the data's learnable signal at **CV
@@ -117,7 +117,7 @@ from cardiotoxicity_pipeline import (
 )
 
 # Official hERG benchmark via TDC (pip install PyTDC), class-balanced 800-mol set
-smiles, labels, names = load_herg_dataset(source="tdc", tdc_name="hERG_Karim", n_samples=800)
+smiles, labels, names = load_herg_dataset(source="tdc", tdc_name="herg_karim", n_samples=800)
 # ...or a CSV you downloaded from any official source (columns auto-detected):
 # smiles, labels, names = load_herg_dataset(local_path="herg.csv", n_samples=800)
 
@@ -182,7 +182,7 @@ interpretable.
 
 | Dataset | Source | Load |
 |---|---|---|
-| **hERG blockers (Karim et al. 2021, ~13,445)** | [TDC](https://tdcommons.ai/single_pred_tasks/tox/) | `load_herg_dataset(source="tdc", tdc_name="hERG_Karim")` |
+| **hERG blockers (Karim et al. 2021, ~13,445)** | [TDC](https://tdcommons.ai/single_pred_tasks/tox/) | `load_herg_dataset(source="tdc", tdc_name="herg_karim")` |
 | **hERG blockers (Wang et al. 2016, ~655)** | [TDC](https://tdcommons.ai/single_pred_tasks/tox/) | `load_herg_dataset(source="tdc", tdc_name="hERG")` |
 | Underlying bioactivity source | [ChEMBL target CHEMBL240](https://www.ebi.ac.uk/chembl/target_report_card/CHEMBL240/) | — |
 | Your own CSV (SMILES + label) | any | `load_herg_dataset(local_path="herg.csv")` |
