@@ -57,13 +57,30 @@ SMILES strings
   **toxicity-mechanism** clusters (e.g. class-III antiarrhythmics vs.
   antipsychotic hERG blockers vs. antihistamine blockers) — with no labels.
 
-## Installation
+## Run in Google Colab (easiest)
+
+Open **`cardiotoxicity_pipeline_colab.ipynb`** in Colab and choose
+**Runtime → Run all**:
+
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/NewDetroit/cardiogenAI/blob/claude/hybrid-qml-classification-pipeline-ulmbrp/cardiotoxicity_pipeline_colab.ipynb)
+
+The notebook is self-contained (it writes the pipeline module to disk, so no
+clone is needed), installs all dependencies, downloads the real ChemBERTa
+weights, runs all five stages, and plots the quantum kernel and a 2-D molecule
+map coloured by prediction and mechanism cluster. Colab has internet access to
+`huggingface.co`, so **no extra setup is required** — a GPU runtime is optional
+but faster.
+
+## Installation (local)
 
 Python 3.10+ required.
 
 ```bash
 pip install -r requirements.txt
 ```
+
+To run locally you need network access to `huggingface.co` so ChemBERTa can be
+downloaded on first use (see **Network requirement** below).
 
 ## Usage
 
