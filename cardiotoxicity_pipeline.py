@@ -701,16 +701,23 @@ def _pick_column(columns, given, aliases, kind):
 
 
 def _read_dataframe(path: str):
-    """Read a CSV / CSV.gz / .tar.xz(csv inside) into a DataFrame."""
+    """Read a tabular file (CSV / CSV.gz / TSV / .tab / .txt / .tar.xz) -> DataFrame."""
     import pandas as pd
 
-    if path.endswith((".tar.xz", ".tar.gz", ".tgz")):
-        mode = "r:xz" if path.endswith(".tar.xz") else "r:gz"
+    low = path.lower()
+    if low.endswith((".tar.xz", ".tar.gz", ".tgz")):
+        mode = "r:xz" if low.endswith(".tar.xz") else "r:gz"
         with tarfile.open(path, mode) as tar:
-            member = next(m for m in tar.getmembers() if m.name.endswith(".csv"))
+            member = next(m for m in tar.getmembers()
+                          if m.name.lower().endswith((".csv", ".tsv", ".tab", ".txt")))
             with tar.extractfile(member) as fh:
-                return pd.read_csv(fh)
-    return pd.read_csv(path)  # pandas transparently handles .gz/.zip
+                sep = "\t" if member.name.lower().endswith((".tsv", ".tab")) else ","
+                return pd.read_csv(fh, sep=sep)
+    if low.endswith((".tsv", ".tab")):
+        return pd.read_csv(path, sep="\t")
+    if low.endswith(".txt"):
+        return pd.read_csv(path, sep=None, engine="python")  # sniff delimiter
+    return pd.read_csv(path)  # pandas transparently handles .csv/.gz/.zip
 
 
 def _from_local(path, smiles_col, label_col):
