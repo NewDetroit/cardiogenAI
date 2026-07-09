@@ -12,16 +12,19 @@ sub-groups among the flagged molecules:
     [Step 1] LLM Semantic Extraction   ChemBERTa (DeepChem/ChemBERTa-77M-MTR)
        |                               -> dense (N, 384) chemical embeddings
        v
-    [Step 2] Topological Compression   UMAP -> n_qubits dimensions
-       |                               (n_neighbors=5, min_dist=0.1)
+    [Step 2] Topological Compression   supervised UMAP -> n_qubits dimensions
+       |                               (fit on train labels; test mapped label-free)
        v
-    [Step 3] Quantum Kernel            ZZFeatureMap(reps=2, entanglement='linear')
-       |                               fidelity kernel |<phi(x)|phi(y)>|^2
+    [Step 3] Quantum Kernel            bandwidth feature map (H, RZ(2c*z),
+       |                               RZZ(2c^2*z_m*z_n); NO (pi-z) offsets)
+       |                               fidelity |<phi(x)|phi(y)>|^2  OR projected
+       |                               (Bloch-vector Gaussian) kernel
        v
     [Step 4] Stage 1: Supervised       SVC(kernel='precomputed')  ==>  QSVC triage
-       |          Binary label: 0 = Safe (non-blocker), 1 = Toxic (hERG blocker)
-       |          with class balancing, CV-tuned C, and threshold calibration,
-       |          benchmarked against a classical RBF-SVC baseline.
+       |          Binary label: 0 = Safe (non-blocker), 1 = Toxic (hERG blocker).
+       |          Class balancing; bandwidth c + C + threshold chosen on a clean
+       |          validation holdout (leakage-free); classical baselines on the
+       |          same features and on raw ChemBERTa.
        v
     [Step 5] Stage 2: Unsupervised     SpectralClustering(affinity='precomputed')
                                        over the quantum-kernel sub-matrix of the
@@ -75,7 +78,7 @@ from sklearn.metrics import (
     roc_auc_score,
     roc_curve,
 )
-from sklearn.model_selection import StratifiedKFold, cross_val_score, train_test_split
+from sklearn.model_selection import train_test_split
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import MinMaxScaler, StandardScaler
 from sklearn.svm import SVC
@@ -83,6 +86,8 @@ from transformers import AutoModel, AutoTokenizer
 
 import umap
 
+from qiskit import QuantumCircuit
+from qiskit.circuit import ParameterVector
 from qiskit.quantum_info import Statevector
 
 # --- Qiskit version-compatibility shim ------------------------------------- #
@@ -133,22 +138,29 @@ class PipelineConfig:
 
     # --- Step 2: UMAP compression ---
     # n_qubits controls the Hilbert-space dimension (2**n_qubits). Large values
-    # cause *kernel concentration*: the fidelity |<phi(x)|phi(y)>|^2 -> 0 for all
-    # x != y and the kernel degenerates to the identity matrix (the QSVC then
-    # predicts a single class). Keep n_qubits small (6-10). 16 is NOT usable here.
+    # cause *kernel concentration*: fidelities -> 0 for all x != y and the kernel
+    # degenerates to the identity matrix. Keep n_qubits small (6-10).
     n_qubits: int = 8               # UMAP output dim == number of qubits
     umap_n_neighbors: int = 15
     umap_min_dist: float = 0.1
     umap_metric: str = "cosine"
+    # Supervised UMAP shapes the embedding with class labels (train only; test is
+    # mapped label-free via transform()). target_weight in [0,1]: 0 = unsupervised,
+    # 1 = fully supervised (risks train/test mismatch); 0.3-0.6 is a good range.
+    umap_supervised: bool = True
+    umap_target_weight: float = 0.5
 
     # --- Step 3: Quantum feature map / kernel ---
-    feature_map_reps: int = 2
-    entanglement: str = "linear"
-    # Encoding bandwidth gamma: features are scaled to [0, gamma*pi] before
-    # encoding. gamma < 1 keeps states closer together, raising off-diagonal
-    # fidelities and countering concentration (Shaydulin & Wild, 2022).
-    encoding_scale: float = 1.0
-    use_fidelity_primitive: bool = False  # True -> Qiskit FidelityQuantumKernel
+    feature_map_reps: int = 1       # each rep compounds phase spread -> use 1
+    entanglement: str = "linear"    # "linear", "circular", or "full"
+    kernel_type: str = "fidelity"   # "fidelity" or "projected" (Huang et al. 2021)
+    projected_gamma: float = 1.0    # Gaussian width for the projected kernel
+    # Encoding bandwidth c: phases are 2*c*z (and 2*c^2*z_m*z_n). c < 1 counters
+    # concentration (Shaydulin & Wild 2022). tune_bandwidth grid-searches it by
+    # kernel-target alignment; () disables and uses encoding_scale directly.
+    encoding_scale: float = 0.4
+    tune_bandwidth: tuple[float, ...] = (0.05, 0.1, 0.2, 0.4, 0.7, 1.0)
+    use_fidelity_primitive: bool = False  # (legacy flag; unused by the custom map)
 
     # --- Step 4: QSVC triage ---
     svc_C: float = 1.0
@@ -168,6 +180,9 @@ class PipelineConfig:
     n_samples: int = 408                  # balanced hERG working-set size
     max_quantum_samples: int = 1000       # hard cap on molecules in the quantum kernel
     test_size: float = 0.25
+    val_size: float = 0.2                 # fraction of TRAIN held out for leakage-free
+                                          # model selection (supervised UMAP is fit on
+                                          # the remaining "fit" split only)
     random_state: int = 42
 
 
@@ -283,9 +298,10 @@ class MoleculeEmbedder:
 # Step 2: Topological Compression (UMAP)
 # --------------------------------------------------------------------------- #
 class TopologicalCompressor:
-    """Compresses ChemBERTa embeddings to `n_qubits` dimensions with UMAP, then
-    rescales each feature into [0, pi] so it is a valid rotation angle for the
-    quantum feature map.
+    """Compresses ChemBERTa embeddings to `n_qubits` dimensions with UMAP and
+    MinMax-scales each feature to [0, 1] (the quantum feature map then applies
+    the encoding bandwidth). Optionally uses **supervised** UMAP so the embedding
+    carries class structure -- fit on train labels, transform test label-free.
     """
 
     def __init__(self, config: PipelineConfig):
@@ -295,20 +311,24 @@ class TopologicalCompressor:
             min_dist=config.umap_min_dist,
             n_components=config.n_qubits,
             metric=config.umap_metric,
+            target_weight=config.umap_target_weight,
             random_state=config.random_state,
         )
-        # Scale features to [0, gamma*pi]; gamma = encoding bandwidth.
-        self._angle_max = float(config.encoding_scale) * np.pi
-        self.scaler = MinMaxScaler(feature_range=(0.0, self._angle_max))
+        self.scaler = MinMaxScaler(feature_range=(0.0, 1.0))
         self._fitted = False
 
-    def fit_transform(self, X_train: np.ndarray) -> np.ndarray:
+    def fit_transform(self, X_train: np.ndarray, y_train=None) -> np.ndarray:
+        supervised = self.config.umap_supervised and y_train is not None
         logger.info(
-            "Fitting UMAP: %s -> %d dims (n_neighbors=%d, min_dist=%.2f, metric=%s)",
+            "Fitting %s UMAP: %s -> %d dims (n_neighbors=%d, min_dist=%.2f, "
+            "metric=%s%s)",
+            "supervised" if supervised else "unsupervised",
             X_train.shape, self.config.n_qubits, self.config.umap_n_neighbors,
             self.config.umap_min_dist, self.config.umap_metric,
+            f", target_weight={self.config.umap_target_weight}" if supervised else "",
         )
-        reduced = self.reducer.fit_transform(X_train)
+        reduced = (self.reducer.fit_transform(X_train, y=np.asarray(y_train))
+                   if supervised else self.reducer.fit_transform(X_train))
         scaled = self.scaler.fit_transform(reduced)
         self._fitted = True
         return scaled.astype(np.float64)
@@ -318,78 +338,117 @@ class TopologicalCompressor:
             raise RuntimeError("Call fit_transform on training data first.")
         reduced = self.reducer.transform(X)
         scaled = self.scaler.transform(reduced)
-        return np.clip(scaled, 0.0, self._angle_max).astype(np.float64)
+        return np.clip(scaled, 0.0, 1.0).astype(np.float64)
 
 
 # --------------------------------------------------------------------------- #
 # Step 3: Quantum Feature Map & Kernel
 # --------------------------------------------------------------------------- #
+def _entangling_pairs(n_qubits: int, entanglement: str) -> list[tuple[int, int]]:
+    if entanglement == "full":
+        return [(i, j) for i in range(n_qubits) for j in range(i + 1, n_qubits)]
+    pairs = [(i, i + 1) for i in range(n_qubits - 1)]           # linear
+    if entanglement == "circular" and n_qubits > 2:
+        pairs.append((n_qubits - 1, 0))
+    return pairs
+
+
 class QuantumProcessor:
-    """Builds the ZZFeatureMap and computes the fidelity quantum kernel
+    """Encodes features with a **bandwidth-controlled** feature map and computes
+    a quantum kernel, addressing the exponential concentration of fidelity
+    kernels (Shaydulin & Wild 2022; Huang et al. 2021).
 
-        K(x, y) = |<phi(x)|phi(y)>|^2
+    Feature map (per repetition), for bandwidth ``c`` and inputs ``z`` scaled to
+    [0, 1]:
 
-    with |phi(.)> prepared by the ZZFeatureMap.
+        H on every qubit;  P(2 c z_k) on qubit k;
+        for each entangling pair (m, n):  CX; P(2 c^2 z_m z_n); CX.
 
-    By default the kernel is computed **exactly** by simulating each feature
-    map circuit once with the statevector simulator and forming pairwise
-    overlaps -- O(N) circuit simulations + O(N^2) vectorised inner products.
-    This is mathematically identical to a noiseless ``FidelityQuantumKernel``
-    but scales to hundreds/thousands of molecules (the compute-uncompute
-    primitive runs O(N^2) circuits and does not). Set
-    ``use_fidelity_primitive=True`` to use Qiskit's ``FidelityQuantumKernel``.
+    Note there are **no** ``(pi - z_m)(pi - z_n)`` offsets (the Qiskit
+    ``ZZFeatureMap`` default, a notorious concentration amplifier). Small ``c``
+    keeps phases from wandering across [0, 2pi), preventing the destructive
+    interference that drives the kernel to the identity.
+
+    Kernels:
+      * ``kernel_type="fidelity"`` : K = |<phi(x)|phi(y)>|^2 (exact statevector).
+      * ``kernel_type="projected"``: Gaussian kernel on single-qubit Bloch
+        vectors of |phi(.)> (projected quantum kernel, Huang et al. 2021), which
+        sidesteps concentration structurally and is far more shot/noise friendly
+        on hardware.
     """
 
-    def __init__(self, config: PipelineConfig):
+    def __init__(self, config: PipelineConfig, bandwidth: float | None = None):
         self.config = config
-        self.feature_map = _zz_feature_map(
-            feature_dimension=config.n_qubits,
-            reps=config.feature_map_reps,
-            entanglement=config.entanglement,
-        )
-        # Robust parameter ordering (x[0], x[1], ... x[k]) by parsed index so
-        # binding is correct even for n_qubits >= 10.
-        self._params = sorted(
-            self.feature_map.parameters,
-            key=lambda p: int(p.name.split("[")[1].rstrip("]")),
-        )
-        self._fqk = None
-        if config.use_fidelity_primitive:
-            if not _HAS_FIDELITY:
-                raise RuntimeError("FidelityQuantumKernel/fidelity primitive unavailable.")
-            self._fqk = FidelityQuantumKernel(
-                feature_map=self.feature_map,
-                fidelity=ComputeUncompute(sampler=_Sampler()),
-            )
+        self.n_qubits = config.n_qubits
+        self.bandwidth = float(config.encoding_scale if bandwidth is None else bandwidth)
+        self._z = ParameterVector("z", self.n_qubits)
+        self.feature_map = self._build_feature_map()
         logger.info(
-            "Quantum kernel ready: ZZFeatureMap(qubits=%d, reps=%d, "
-            "entanglement='%s'), depth=%d, mode=%s",
-            config.n_qubits, config.feature_map_reps, config.entanglement,
-            self.feature_map.decompose().depth(),
-            "fidelity-primitive" if self._fqk else "exact-statevector",
+            "Quantum kernel: bandwidth c=%.3g, qubits=%d, reps=%d, entangle='%s', "
+            "kernel='%s', depth=%d",
+            self.bandwidth, self.n_qubits, config.feature_map_reps,
+            config.entanglement, config.kernel_type, self.feature_map.depth(),
         )
+
+    def _build_feature_map(self) -> QuantumCircuit:
+        c, z = self.bandwidth, self._z
+        qc = QuantumCircuit(self.n_qubits)
+        pairs = _entangling_pairs(self.n_qubits, self.config.entanglement)
+        for _ in range(self.config.feature_map_reps):
+            for k in range(self.n_qubits):
+                qc.h(k)
+                qc.p(2.0 * c * z[k], k)
+            for (m, n) in pairs:
+                qc.cx(m, n)
+                qc.p(2.0 * c * c * z[m] * z[n], n)
+                qc.cx(m, n)
+        return qc
 
     def _statevectors(self, X: np.ndarray) -> np.ndarray:
         """Simulate the feature map once per row; return (N, 2**n_qubits) complex."""
-        dim = 2 ** self.feature_map.num_qubits
+        dim = 2 ** self.n_qubits
         states = np.empty((len(X), dim), dtype=np.complex128)
         for i, x in enumerate(X):
             bound = self.feature_map.assign_parameters(
-                {p: float(v) for p, v in zip(self._params, x)}
+                {p: float(v) for p, v in zip(self._z, x)}
             )
             states[i] = Statevector.from_instruction(bound).data
         return states
 
+    def _bloch_features(self, states: np.ndarray) -> np.ndarray:
+        """Single-qubit Bloch vectors (<X>,<Y>,<Z> per qubit) for each state,
+        the classical descriptor behind the projected quantum kernel."""
+        n, dim = len(states), states.shape[1]
+        idx = np.arange(dim)
+        feats = np.empty((n, 3 * self.n_qubits))
+        probs = np.abs(states) ** 2
+        for k in range(self.n_qubits):
+            bit = (idx >> k) & 1                      # qiskit little-endian
+            partner = idx ^ (1 << k)
+            prod = np.conj(states) * states[:, partner]
+            mask0 = bit == 0
+            feats[:, 3 * k + 0] = 2.0 * prod[:, mask0].real.sum(axis=1)   # <X>
+            feats[:, 3 * k + 1] = 2.0 * prod[:, mask0].imag.sum(axis=1)   # <Y>
+            feats[:, 3 * k + 2] = (probs * (1 - 2 * bit)).sum(axis=1)      # <Z>
+        return feats
+
     def kernel(self, X_a: np.ndarray, X_b: np.ndarray | None = None) -> np.ndarray:
-        """Fidelity kernel between X_a and X_b (or X_a with itself)."""
+        """Quantum kernel between X_a and X_b (or X_a with itself)."""
         n_b = len(X_a) if X_b is None else len(X_b)
-        logger.info("Computing quantum kernel (%d x %d, %s) ...", len(X_a), n_b,
-                    "fidelity-primitive" if self._fqk else "exact-statevector")
-        if self._fqk is not None:
-            return self._fqk.evaluate(x_vec=X_a) if X_b is None \
-                else self._fqk.evaluate(x_vec=X_a, y_vec=X_b)
+        logger.info("Computing %s quantum kernel (%d x %d, c=%.3g) ...",
+                    self.config.kernel_type, len(X_a), n_b, self.bandwidth)
         S_a = self._statevectors(X_a)
         S_b = S_a if X_b is None else self._statevectors(X_b)
+        if self.config.kernel_type == "projected":
+            B_a = self._bloch_features(S_a)
+            B_b = B_a if X_b is None else self._bloch_features(S_b)
+            # ||rho_k(i)-rho_k(j)||_F^2 = 1/2 ||bloch_i-bloch_j||^2, folded into gamma.
+            sq = (
+                (B_a ** 2).sum(1)[:, None]
+                + (B_b ** 2).sum(1)[None, :]
+                - 2.0 * B_a @ B_b.T
+            )
+            return np.exp(-self.config.projected_gamma * np.clip(sq, 0.0, None))
         K = np.abs(S_a.conj() @ S_b.T) ** 2
         return np.clip(K, 0.0, 1.0)
 
@@ -424,14 +483,20 @@ class PipelineResult:
     n_train: int
     full_kernel: np.ndarray = field(repr=False, default=None)
 
+    # Quantum-kernel health
+    bandwidth: float = 0.0            # selected encoding bandwidth c
+    kta: float = 0.0                  # kernel-target alignment
+    offdiag_mean: float = 0.0         # mean off-diagonal kernel entry
+
 
 # --------------------------------------------------------------------------- #
 # Steps 4 & 5: two-stage hybrid pipeline
 # --------------------------------------------------------------------------- #
 class ToxicityPipeline:
-    """End-to-end orchestrator (Steps 1-5) with class balancing, CV-tuned C,
-    decision-threshold calibration, a classical baseline, and cross-validated
-    reporting."""
+    """End-to-end orchestrator (Steps 1-5). Uses a fit/val/test split so the
+    supervised UMAP, encoding bandwidth, SVC C, and decision threshold are all
+    chosen on a validation set the embedding never saw (leakage-free), with the
+    QSVC benchmarked against classical baselines on the identical features."""
 
     def __init__(self, config: PipelineConfig | None = None):
         self.config = config or PipelineConfig()
@@ -441,23 +506,50 @@ class ToxicityPipeline:
         self.classifier: SVC | None = None
 
     # ---- kernel cross-validation helpers ---------------------------------- #
-    def _kernel_oof_and_cv(self, K_tr, y_tr, C):
-        """Out-of-fold decision scores + per-fold AUCs for a precomputed kernel.
+    @staticmethod
+    def _kta(K, y):
+        """Centered kernel-target alignment: how well K's geometry matches the
+        labels. KTA = <K, yy^T> / (||K|| ||yy^T||), with y in {-1,+1}."""
+        yy = np.outer(y, y).astype(float)
+        num = float((K * yy).sum())
+        den = float(np.linalg.norm(K) * np.linalg.norm(yy))
+        return num / den if den > 0 else 0.0
 
-        Manual CV is required because sklearn's cross_val_* slice only the rows
-        of a precomputed kernel, not the train columns.
-        """
+    def _select_hyperparams(self, X_fit, y_fit, X_val, y_val):
+        """Jointly grid-search encoding bandwidth c and SVC C, scoring each on the
+        **clean validation set** (embedded without labels). Leakage-free because
+        the supervised UMAP only ever saw the fit set. Returns the best config and
+        the validation decision scores of the winning (fit-trained) model."""
         cfg = self.config
-        skf = StratifiedKFold(cfg.cv_folds, shuffle=True, random_state=cfg.random_state)
-        oof = np.zeros(len(y_tr))
-        aucs = []
-        for tr, va in skf.split(np.zeros(len(y_tr)), y_tr):
-            svc = SVC(kernel="precomputed", C=C, class_weight=cfg.class_weight)
-            svc.fit(K_tr[np.ix_(tr, tr)], y_tr[tr])
-            s = svc.decision_function(K_tr[np.ix_(va, tr)])
-            oof[va] = s
-            aucs.append(roc_auc_score(y_tr[va], s))
-        return oof, np.array(aucs)
+        c_grid = cfg.tune_bandwidth or (cfg.encoding_scale,)
+        C_grid = cfg.tune_C or (cfg.svc_C,)
+        y_fit_signed = np.where(y_fit == 1, 1.0, -1.0)
+        best = {"auc": -np.inf, "c": c_grid[0], "C": C_grid[0],
+                "val_scores": None, "kta": 0.0, "off": 0.0}
+        for c in c_grid:
+            qp = QuantumProcessor(cfg, bandwidth=c)
+            K_ff = np.clip((lambda K: (K + K.T) / 2.0)(qp.kernel(X_fit)), 0.0, 1.0)
+            K_vf = qp.kernel(X_val, X_fit)
+            off = K_ff[~np.eye(len(K_ff), dtype=bool)]
+            kta = self._kta(K_ff, y_fit_signed)
+            best_val_here = -np.inf
+            for C in C_grid:
+                svc = SVC(kernel="precomputed", C=C, class_weight=cfg.class_weight)
+                svc.fit(K_ff, y_fit)
+                val_scores = svc.decision_function(K_vf)
+                try:
+                    vauc = roc_auc_score(y_val, val_scores)
+                except ValueError:
+                    vauc = 0.5
+                best_val_here = max(best_val_here, vauc)
+                if vauc > best["auc"]:
+                    best.update(auc=vauc, c=c, C=C, val_scores=val_scores,
+                                kta=kta, off=float(off.mean()))
+            logger.info("  c=%-5.3g  KTA=%.3f off-diag mean=%.4g | best val AUC(C)=%.4f",
+                        c, kta, off.mean(), best_val_here)
+        logger.info("Selected bandwidth c=%.3g, C=%g (val AUC=%.4f)",
+                    best["c"], best["C"], best["auc"])
+        return best
 
     def run(self, smiles, labels, names=None) -> PipelineResult:
         cfg = self.config
@@ -472,85 +564,89 @@ class ToxicityPipeline:
             labels = labels[idx]
             logger.info("Capped working set to %d molecules for the quantum kernel.", len(smiles))
 
-        # ---- stratified split --------------------------------------------- #
+        # ---- stratified train/test split, then a clean validation holdout --- #
+        # Supervised UMAP is fit on the FIT split only; VAL and TEST are embedded
+        # label-free via transform(), so bandwidth/C/threshold are all chosen on
+        # data the embedding never saw (no leakage). The final QSVC is trained on
+        # FIT and evaluated on the untouched TEST set.
         idx_train, idx_test = train_test_split(
             np.arange(len(smiles)), test_size=cfg.test_size,
             stratify=labels, random_state=cfg.random_state,
         )
-        order = np.concatenate([idx_train, idx_test])
-        n_train = len(idx_train)
+        idx_fit, idx_val = train_test_split(
+            idx_train, test_size=cfg.val_size, stratify=labels[idx_train],
+            random_state=cfg.random_state,
+        )
+        order = np.concatenate([idx_fit, idx_val, idx_test])
+        n_fit, n_val, n_test = len(idx_fit), len(idx_val), len(idx_test)
+        n_train = n_fit + n_val
         smiles_ord = [smiles[i] for i in order]
         y_ord = labels[order]
+        y_fit, y_val = y_ord[:n_fit], y_ord[n_fit:n_train]
         y_train, y_test = y_ord[:n_train], y_ord[n_train:]
         logger.info(
-            "Working set: %d molecules (%d train / %d test), toxic rate train=%.2f test=%.2f",
-            len(smiles), n_train, len(idx_test), y_train.mean(), y_test.mean(),
+            "Working set: %d molecules (fit %d / val %d / test %d), toxic rate "
+            "fit=%.2f val=%.2f test=%.2f", len(smiles), n_fit, n_val, n_test,
+            y_fit.mean(), y_val.mean(), y_test.mean(),
         )
 
         # ---- Step 1: ChemBERTa embeddings --------------------------------- #
         logger.info("=== Step 1/5: ChemBERTa semantic extraction ===")
         E_all = self.embedder.embed(smiles_ord)
-        E_train, E_test = E_all[:n_train], E_all[n_train:]
+        E_fit, E_val, E_test = E_all[:n_fit], E_all[n_fit:n_train], E_all[n_train:]
 
-        # ---- Step 2: UMAP compression ------------------------------------- #
+        # ---- Step 2: UMAP compression (supervised, fit on FIT labels only) -- #
         logger.info("=== Step 2/5: UMAP topological compression ===")
-        X_train = self.compressor.fit_transform(E_train)
+        X_fit = self.compressor.fit_transform(E_fit, y_fit)
+        X_val = self.compressor.transform(E_val)
         X_test = self.compressor.transform(E_test)
-        X_all = np.vstack([X_train, X_test])
+        X_all = np.vstack([X_fit, X_val, X_test])
 
-        # ---- Step 3: quantum kernel (one full N x N; blocks are sub-matrices) #
-        logger.info("=== Step 3/5: Quantum kernel generation ===")
+        # ---- Step 3+4: bandwidth/C selection on VAL, then final kernel ----- #
+        logger.info("=== Step 3/5: Quantum kernel + leakage-free selection ===")
+        best = self._select_hyperparams(X_fit, y_fit, X_val, y_val)
+        best_c, best_C, val_auc = best["c"], best["C"], best["auc"]
+
+        self.quantum = QuantumProcessor(cfg, bandwidth=best_c)
         K_full = self.quantum.kernel(X_all)
         K_full = np.clip((K_full + K_full.T) / 2.0, 0.0, 1.0)  # symmetrise
-        K_train = K_full[:n_train, :n_train]
-        K_test = K_full[n_train:, :n_train]
+        K_fit = K_full[:n_fit, :n_fit]                         # fit-vs-fit (training)
+        K_test_fit = K_full[n_train:, :n_fit]                  # test-vs-fit
 
-        # Kernel-concentration diagnostic: if off-diagonal fidelities collapse to
-        # ~0 the kernel is near-identity and the QSVC will degenerate to one
-        # class. This is the dominant failure mode as n_qubits grows.
+        # Kernel-health diagnostic: the off-diagonal distribution. Healthy kernels
+        # spread mass across ~[0.05, 0.9]; a spike at 0 => concentration (near
+        # identity), a spike at 1 => the map is too weak to separate anything.
         offdiag = K_full[~np.eye(len(K_full), dtype=bool)]
-        logger.info("Quantum kernel off-diagonal: mean=%.4g median=%.4g max=%.4g",
-                    offdiag.mean(), np.median(offdiag), offdiag.max())
+        pct = np.percentile(offdiag, [5, 25, 50, 75, 95])
+        logger.info("Kernel off-diagonal: mean=%.4g pct[5,25,50,75,95]=%s max=%.4g | KTA=%.4f",
+                    offdiag.mean(), np.round(pct, 4).tolist(), offdiag.max(), best["kta"])
         if offdiag.mean() < 1e-3:
             logger.warning(
                 "Quantum kernel is CONCENTRATED (near-identity): off-diagonal "
-                "mean=%.2g. The QSVC will not generalise. Reduce n_qubits "
-                "(<=10) and/or config.encoding_scale (<1.0).", offdiag.mean())
+                "mean=%.2g. The QSVC will not generalise. Reduce n_qubits (<=10), "
+                "feature_map_reps, and/or the bandwidth grid.", offdiag.mean())
+        elif offdiag.mean() > 0.98:
+            logger.warning(
+                "Quantum kernel is near-constant (~all ones): off-diagonal "
+                "mean=%.3g. The feature map is too weak; raise the bandwidth.",
+                offdiag.mean())
 
-        # ---- Step 4: Stage 1 supervised QSVC triage ----------------------- #
+        # ---- Step 4: Stage 1 QSVC (train on FIT, threshold on VAL) --------- #
         logger.info("=== Step 4/5: Stage 1 - supervised QSVC triage ===")
-        C_grid = cfg.tune_C or (cfg.svc_C,)
-        best_C, best_auc, best_oof = cfg.svc_C, -np.inf, None
-        for C in C_grid:
-            oof, aucs = self._kernel_oof_and_cv(K_train, y_train, C)
-            logger.info("  C=%-6g  CV AUC=%.4f +/- %.4f", C, aucs.mean(), aucs.std())
-            if aucs.mean() > best_auc:
-                best_C, best_auc, best_oof, best_aucs = C, aucs.mean(), oof, aucs
-        logger.info("Selected C=%g (CV AUC=%.4f)", best_C, best_auc)
-
         self.classifier = SVC(kernel="precomputed", C=best_C,
                               class_weight=cfg.class_weight)
-        self.classifier.fit(K_train, y_train)
+        self.classifier.fit(K_fit, y_fit)
 
-        # decision-threshold calibration from out-of-fold train scores (Youden's J).
-        # Guard: a Youden's-J threshold picked on the train scale does not transfer
-        # when scores are near-constant (degenerate kernel) or clearly separated
-        # from the test scale; fall back to 0.0 rather than push everything to one
-        # class.
+        # Threshold: Youden's J on the clean validation scores (model trained on
+        # FIT, val embedded label-free). Same model/scale used for test below.
         threshold = 0.0
-        if cfg.calibrate_threshold:
-            fpr, tpr, thr = roc_curve(y_train, best_oof)
-            cand = float(thr[np.argmax(tpr - fpr)])
-            test_scores = self.classifier.decision_function(K_test)
-            spans_test = test_scores.min() <= cand <= test_scores.max()
-            if np.std(best_oof) > 1e-6 and spans_test:
-                threshold = cand
-                logger.info("Calibrated decision threshold: %.4f (Youden's J on train CV)", threshold)
-            else:
-                logger.warning("Skipping threshold calibration (degenerate/off-scale "
-                               "candidate=%.4g); using 0.0.", cand)
+        if cfg.calibrate_threshold and best["val_scores"] is not None \
+                and np.std(best["val_scores"]) > 1e-6:
+            fpr, tpr, thr = roc_curve(y_val, best["val_scores"])
+            threshold = float(thr[np.argmax(tpr - fpr)])
+            logger.info("Calibrated decision threshold: %.4f (Youden's J on validation)", threshold)
 
-        y_score_test = self.classifier.decision_function(K_test)
+        y_score_test = self.classifier.decision_function(K_test_fit)
         y_pred_test = (y_score_test >= threshold).astype(int)
 
         acc = accuracy_score(y_test, y_pred_test)
@@ -562,17 +658,20 @@ class ToxicityPipeline:
         report = classification_report(
             y_test, y_pred_test, target_names=["Safe (0)", "Toxic (1)"], zero_division=0,
         )
-        logger.info("QSVC test: accuracy=%.4f  f1=%.4f  roc_auc=%.4f", acc, f1, auc)
+        logger.info("QSVC test: accuracy=%.4f  f1=%.4f  roc_auc=%.4f (val AUC=%.4f)",
+                    acc, f1, auc, val_auc)
 
-        # ---- classical baseline on raw embeddings ------------------------- #
+        # ---- classical baselines (fit-train, val-select, test-report) ------ #
         baseline = None
         if cfg.run_classical_baseline:
-            baseline = self._classical_baseline(E_train, y_train, E_test, y_test,
-                                                X_train=X_train, X_test=X_test)
+            baseline = self._classical_baseline(
+                E_fit, y_fit, E_val, y_val, E_test, y_test,
+                X_fit=X_fit, X_val=X_val, X_test=X_test)
 
         # ---- Step 5: Stage 2 mechanism sub-grouping ----------------------- #
+        # Triage every molecule with the fit-trained QSVC (columns = fit block).
         logger.info("=== Step 5/5: Stage 2 - spectral mechanism discovery ===")
-        y_pred_all = (self.classifier.decision_function(K_full[:, :n_train]) >= threshold).astype(int)
+        y_pred_all = (self.classifier.decision_function(K_full[:, :n_fit]) >= threshold).astype(int)
         toxic_local = np.flatnonzero(y_pred_all == 1)
         toxic_index = order[toxic_local]
         cluster_labels, cluster_summary = None, None
@@ -596,61 +695,68 @@ class ToxicityPipeline:
         return PipelineResult(
             y_pred_test=y_pred_test, y_score_test=y_score_test, threshold=threshold,
             accuracy=acc, f1=f1, roc_auc=auc, report=report,
-            best_C=best_C, cv_auc_mean=float(best_auc), cv_auc_std=float(best_aucs.std()),
+            best_C=best_C, cv_auc_mean=float(val_auc), cv_auc_std=0.0,
             baseline=baseline, toxic_index=toxic_index, cluster_labels=cluster_labels,
             cluster_summary=cluster_summary, order=order, n_train=n_train, full_kernel=K_full,
+            bandwidth=float(best_c), kta=float(best["kta"]), offdiag_mean=float(offdiag.mean()),
         )
 
-    def _classical_baseline(self, E_train, y_train, E_test, y_test,
-                            X_train=None, X_test=None) -> dict:
-        """Classical baselines for a fair, layered comparison against the QSVC:
+    def _classical_baseline(self, E_fit, y_fit, E_val, y_val, E_test, y_test,
+                            X_fit=None, X_val=None, X_test=None) -> dict:
+        """Classical baselines, trained/selected/reported on the SAME fit/val/test
+        splits as the QSVC for a fair, leakage-free comparison:
 
         * ``rbf_umap`` / ``linsvc_umap`` -- classical SVC on the **same** UMAP
-          features the quantum kernel sees. This is the apples-to-apples control:
-          quantum ZZ kernel vs classical RBF kernel on identical n_qubits-d
-          inputs isolates what the quantum feature map contributes, independent
-          of UMAP compression.
+          features the quantum kernel sees (apples-to-apples control: quantum ZZ
+          kernel vs classical kernel on identical n_qubits-d inputs).
         * ``rbf_384`` / ``logreg_384`` -- on the raw ChemBERTa embeddings, i.e.
           the ceiling you forgo by compressing to n_qubits dimensions.
+
+        The reported ``cv_auc_mean`` is the clean **validation** AUC (comparable
+        to the quantum val AUC); ``test_*`` are on the held-out test set.
         """
         cfg = self.config
         out = {}
-        skf = StratifiedKFold(cfg.cv_folds, shuffle=True, random_state=cfg.random_state)
 
-        def _evaluate(name, model, tr, te):
-            cv_auc = cross_val_score(model, tr, y_train, cv=skf, scoring="roc_auc")
-            model.fit(tr, y_train)
-            score = (model.decision_function(te) if hasattr(model, "decision_function")
-                     else model.predict_proba(te)[:, 1])
-            pred = model.predict(te)
+        def _evaluate(name, model, fit_X, val_X, test_X):
+            model.fit(fit_X, y_fit)
+            def _score(Z):
+                return (model.decision_function(Z) if hasattr(model, "decision_function")
+                        else model.predict_proba(Z)[:, 1])
+            try:
+                val_auc = roc_auc_score(y_val, _score(val_X))
+            except ValueError:
+                val_auc = 0.5
+            score = _score(test_X)
+            pred = model.predict(test_X)
             out[name] = {
-                "cv_auc_mean": float(cv_auc.mean()), "cv_auc_std": float(cv_auc.std()),
+                "cv_auc_mean": float(val_auc), "cv_auc_std": 0.0,
                 "test_auc": float(roc_auc_score(y_test, score)),
                 "test_acc": float(accuracy_score(y_test, pred)),
                 "test_f1": float(f1_score(y_test, pred, zero_division=0)),
             }
-            logger.info("  %-12s CV AUC=%.4f+/-%.4f | test AUC=%.4f acc=%.4f f1=%.4f",
-                        name, out[name]["cv_auc_mean"], out[name]["cv_auc_std"],
+            logger.info("  %-12s val AUC=%.4f | test AUC=%.4f acc=%.4f f1=%.4f",
+                        name, out[name]["cv_auc_mean"],
                         out[name]["test_auc"], out[name]["test_acc"], out[name]["test_f1"])
 
         # Fair, same-features control on the UMAP features (if provided).
-        if X_train is not None and X_test is not None:
-            logger.info("Classical baselines on the same %d-d UMAP features ...", X_train.shape[1])
+        if X_fit is not None and X_val is not None and X_test is not None:
+            logger.info("Classical baselines on the same %d-d UMAP features ...", X_fit.shape[1])
             _evaluate("rbf_umap", make_pipeline(
                 StandardScaler(), SVC(kernel="rbf", C=10.0, gamma="scale",
-                                      class_weight=cfg.class_weight)), X_train, X_test)
+                                      class_weight=cfg.class_weight)), X_fit, X_val, X_test)
             _evaluate("linsvc_umap", make_pipeline(
                 StandardScaler(), SVC(kernel="linear", C=1.0,
-                                      class_weight=cfg.class_weight)), X_train, X_test)
+                                      class_weight=cfg.class_weight)), X_fit, X_val, X_test)
 
         # Ceiling on the raw ChemBERTa embeddings.
-        logger.info("Classical baselines on raw %d-d ChemBERTa embeddings ...", E_train.shape[1])
+        logger.info("Classical baselines on raw %d-d ChemBERTa embeddings ...", E_fit.shape[1])
         _evaluate("rbf_384", make_pipeline(
             StandardScaler(), SVC(kernel="rbf", C=10.0, gamma="scale",
-                                  class_weight=cfg.class_weight)), E_train, E_test)
+                                  class_weight=cfg.class_weight)), E_fit, E_val, E_test)
         _evaluate("logreg_384", make_pipeline(
             StandardScaler(), LogisticRegression(max_iter=2000,
-                                                 class_weight=cfg.class_weight)), E_train, E_test)
+                                                 class_weight=cfg.class_weight)), E_fit, E_val, E_test)
         return out
 
 
@@ -1029,7 +1135,9 @@ def print_report(result: PipelineResult) -> None:
     print(cfg_line)
     print(result.report)
     print(f"Selected C        : {result.best_C:g}")
-    print(f"Train CV ROC-AUC  : {result.cv_auc_mean:.4f} +/- {result.cv_auc_std:.4f}")
+    print(f"Bandwidth c       : {result.bandwidth:g}  (KTA={result.kta:.4f}, "
+          f"kernel off-diag mean={result.offdiag_mean:.4g})")
+    print(f"Validation ROC-AUC: {result.cv_auc_mean:.4f}  (leakage-free holdout; used for selection)")
     print(f"Decision threshold: {result.threshold:.4f}")
     print(f"Test Accuracy     : {result.accuracy:.4f}")
     print(f"Test F1-Score     : {result.f1:.4f}")
@@ -1040,11 +1148,11 @@ def print_report(result: PipelineResult) -> None:
         print("QUANTUM vs CLASSICAL  (*_umap = same UMAP features as quantum = fair")
         print("                       control; *_384 = ceiling on raw ChemBERTa embeddings)")
         print(cfg_line)
-        print(f"{'model':13s} {'CV ROC-AUC':>18s} {'test AUC':>10s} {'test acc':>10s} {'test f1':>9s}")
-        print(f"{'quantum':13s} {result.cv_auc_mean:>10.4f}+/-{result.cv_auc_std:<5.4f} "
+        print(f"{'model':13s} {'val AUC':>10s} {'test AUC':>10s} {'test acc':>10s} {'test f1':>9s}")
+        print(f"{'quantum':13s} {result.cv_auc_mean:>10.4f} "
               f"{result.roc_auc:>10.4f} {result.accuracy:>10.4f} {result.f1:>9.4f}")
         for name, m in result.baseline.items():
-            print(f"{name:13s} {m['cv_auc_mean']:>10.4f}+/-{m['cv_auc_std']:<5.4f} "
+            print(f"{name:13s} {m['cv_auc_mean']:>10.4f} "
                   f"{m['test_auc']:>10.4f} {m['test_acc']:>10.4f} {m['test_f1']:>9.4f}")
 
     print("\n" + cfg_line)
