@@ -132,14 +132,22 @@ class PipelineConfig:
     pooling: str = "mean"  # "mean" (masked mean), "cls", or "pooler"
 
     # --- Step 2: UMAP compression ---
-    n_qubits: int = 16              # UMAP output dim == number of qubits (8 or 16)
+    # n_qubits controls the Hilbert-space dimension (2**n_qubits). Large values
+    # cause *kernel concentration*: the fidelity |<phi(x)|phi(y)>|^2 -> 0 for all
+    # x != y and the kernel degenerates to the identity matrix (the QSVC then
+    # predicts a single class). Keep n_qubits small (6-10). 16 is NOT usable here.
+    n_qubits: int = 8               # UMAP output dim == number of qubits
     umap_n_neighbors: int = 15
     umap_min_dist: float = 0.1
     umap_metric: str = "cosine"
 
     # --- Step 3: Quantum feature map / kernel ---
-    feature_map_reps: int = 3
+    feature_map_reps: int = 2
     entanglement: str = "linear"
+    # Encoding bandwidth gamma: features are scaled to [0, gamma*pi] before
+    # encoding. gamma < 1 keeps states closer together, raising off-diagonal
+    # fidelities and countering concentration (Shaydulin & Wild, 2022).
+    encoding_scale: float = 1.0
     use_fidelity_primitive: bool = False  # True -> Qiskit FidelityQuantumKernel
 
     # --- Step 4: QSVC triage ---
@@ -155,8 +163,8 @@ class PipelineConfig:
 
     # --- Data / split / reproducibility ---
     # NOTE: the exact statevector kernel holds 2**n_qubits complex amplitudes per
-    # molecule, so peak memory ~ n_samples * 2**n_qubits * 16 bytes. At n_qubits=16
-    # keep the working set modest (a few hundred to ~1000).
+    # molecule, so peak memory ~ n_samples * 2**n_qubits * 16 bytes. With the
+    # recommended n_qubits in 6-10, a few hundred to ~1000 molecules is fine.
     n_samples: int = 408                  # balanced hERG working-set size
     max_quantum_samples: int = 1000       # hard cap on molecules in the quantum kernel
     test_size: float = 0.25
@@ -289,7 +297,9 @@ class TopologicalCompressor:
             metric=config.umap_metric,
             random_state=config.random_state,
         )
-        self.scaler = MinMaxScaler(feature_range=(0.0, np.pi))
+        # Scale features to [0, gamma*pi]; gamma = encoding bandwidth.
+        self._angle_max = float(config.encoding_scale) * np.pi
+        self.scaler = MinMaxScaler(feature_range=(0.0, self._angle_max))
         self._fitted = False
 
     def fit_transform(self, X_train: np.ndarray) -> np.ndarray:
@@ -308,7 +318,7 @@ class TopologicalCompressor:
             raise RuntimeError("Call fit_transform on training data first.")
         reduced = self.reducer.transform(X)
         scaled = self.scaler.transform(reduced)
-        return np.clip(scaled, 0.0, np.pi).astype(np.float64)
+        return np.clip(scaled, 0.0, self._angle_max).astype(np.float64)
 
 
 # --------------------------------------------------------------------------- #
@@ -495,6 +505,18 @@ class ToxicityPipeline:
         K_train = K_full[:n_train, :n_train]
         K_test = K_full[n_train:, :n_train]
 
+        # Kernel-concentration diagnostic: if off-diagonal fidelities collapse to
+        # ~0 the kernel is near-identity and the QSVC will degenerate to one
+        # class. This is the dominant failure mode as n_qubits grows.
+        offdiag = K_full[~np.eye(len(K_full), dtype=bool)]
+        logger.info("Quantum kernel off-diagonal: mean=%.4g median=%.4g max=%.4g",
+                    offdiag.mean(), np.median(offdiag), offdiag.max())
+        if offdiag.mean() < 1e-3:
+            logger.warning(
+                "Quantum kernel is CONCENTRATED (near-identity): off-diagonal "
+                "mean=%.2g. The QSVC will not generalise. Reduce n_qubits "
+                "(<=10) and/or config.encoding_scale (<1.0).", offdiag.mean())
+
         # ---- Step 4: Stage 1 supervised QSVC triage ----------------------- #
         logger.info("=== Step 4/5: Stage 1 - supervised QSVC triage ===")
         C_grid = cfg.tune_C or (cfg.svc_C,)
@@ -510,12 +532,23 @@ class ToxicityPipeline:
                               class_weight=cfg.class_weight)
         self.classifier.fit(K_train, y_train)
 
-        # decision-threshold calibration from out-of-fold train scores (Youden's J)
+        # decision-threshold calibration from out-of-fold train scores (Youden's J).
+        # Guard: a Youden's-J threshold picked on the train scale does not transfer
+        # when scores are near-constant (degenerate kernel) or clearly separated
+        # from the test scale; fall back to 0.0 rather than push everything to one
+        # class.
         threshold = 0.0
         if cfg.calibrate_threshold:
             fpr, tpr, thr = roc_curve(y_train, best_oof)
-            threshold = float(thr[np.argmax(tpr - fpr)])
-            logger.info("Calibrated decision threshold: %.4f (Youden's J on train CV)", threshold)
+            cand = float(thr[np.argmax(tpr - fpr)])
+            test_scores = self.classifier.decision_function(K_test)
+            spans_test = test_scores.min() <= cand <= test_scores.max()
+            if np.std(best_oof) > 1e-6 and spans_test:
+                threshold = cand
+                logger.info("Calibrated decision threshold: %.4f (Youden's J on train CV)", threshold)
+            else:
+                logger.warning("Skipping threshold calibration (degenerate/off-scale "
+                               "candidate=%.4g); using 0.0.", cand)
 
         y_score_test = self.classifier.decision_function(K_test)
         y_pred_test = (y_score_test >= threshold).astype(int)
@@ -1034,7 +1067,7 @@ def print_report(result: PipelineResult) -> None:
 # Demo entry point
 # --------------------------------------------------------------------------- #
 def main() -> None:
-    config = PipelineConfig(n_qubits=16, n_clusters=3, n_samples=408)
+    config = PipelineConfig(n_qubits=8, n_clusters=3, n_samples=408)
     np.random.seed(config.random_state)
     torch.manual_seed(config.random_state)
 

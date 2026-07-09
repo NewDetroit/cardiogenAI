@@ -76,6 +76,22 @@ kernel, but a ~300×300 kernel takes ~1 s instead of minutes. Set
 `use_fidelity_primitive=True` to switch back to Qiskit's primitive (e.g. for a
 hardware-backed sampler).
 
+**⚠️ Kernel concentration — keep `n_qubits` small.** The fidelity kernel
+`|⟨φ(x)|φ(y)⟩|²` concentrates toward **0 for all `x≠y`** as the number of qubits
+grows: at 16 qubits it is numerically the identity matrix (mean off-diagonal
+≈ 0), so the QSVC sees every molecule as orthogonal and collapses to a single
+class. Measured mean off-diagonal fidelity on this data:
+
+| config | mean off-diagonal | usable? |
+|---|---|---|
+| `n_qubits=8, reps=2` | ~6e-3 | ✅ |
+| `n_qubits=16, reps=3` | ~0 (identity) | ❌ degenerate |
+
+The pipeline **logs the off-diagonal mean every run and warns** when it is
+near-identity. Mitigations: keep `n_qubits` in 6–10, use `reps=1–2`, and lower
+`encoding_scale` (γ<1) to raise off-diagonal fidelities. This is a fundamental
+property of fidelity quantum kernels (Shaydulin & Wild, 2022), not a bug.
+
 ## Run in Google Colab (easiest)
 
 Open **`cardiotoxicity_pipeline_colab.ipynb`** in Colab and choose
@@ -121,7 +137,7 @@ smiles, labels, names = load_herg_dataset(
 # ...or a CSV you downloaded from any official source (columns auto-detected):
 # smiles, labels, names = load_herg_dataset(local_path="herg.csv", n_samples=408)
 
-config = PipelineConfig(n_qubits=16, n_clusters=3, n_samples=408)
+config = PipelineConfig(n_qubits=8, n_clusters=3, n_samples=408)
 result = ToxicityPipeline(config).run(smiles, labels, names)
 
 print_report(result)              # Stage 1 + baseline table + Stage 2 sub-groups
@@ -138,9 +154,10 @@ print(result.cluster_summary)     # per-sub-group physicochemical profile
 |---|---|---|
 | `model_name` | `DeepChem/ChemBERTa-77M-MTR` | HuggingFace chemical LM |
 | `pooling` | `mean` | `mean` (masked), `cls`, or `pooler` token reduction |
-| `n_qubits` | `16` | UMAP output dim = qubit count (8 or 16) |
-| `feature_map_reps` | `3` | ZZFeatureMap repetitions |
-| `n_samples` | `408` | balanced working-set size (mind memory: `2**n_qubits`/mol) |
+| `n_qubits` | `8` | UMAP output dim = qubit count (keep **6–10**; see below) |
+| `feature_map_reps` | `2` | ZZFeatureMap repetitions |
+| `encoding_scale` | `1.0` | encoding bandwidth γ (features → `[0, γπ]`); `<1` fights concentration |
+| `n_samples` | `408` | balanced working-set size |
 | `max_quantum_samples` | `1000` | hard cap on molecules in the quantum kernel |
 | `tune_C` | `(0.1, 1, 10, 100)` | CV grid for the QSVC `C` (`()` disables) |
 | `class_weight` | `balanced` | SVC class weighting |
